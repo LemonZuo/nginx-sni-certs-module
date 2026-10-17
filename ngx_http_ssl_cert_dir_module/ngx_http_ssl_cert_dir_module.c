@@ -212,7 +212,9 @@ typedef struct {
     ngx_str_t                      path;      /* 清单文件完整路径，以 '\0' 结尾 */
     ngx_str_t                      dir;       /* 清单文件所在目录（指向 path 的前半部分） */
     ngx_log_t                     *log;       /* 创建内存池用的日志对象（cycle 的日志） */
-    time_t                         interval;  /* 检查间隔，秒 */
+    time_t                         interval;  /* 当前生效的检查间隔，秒 */
+    time_t                         default_interval; /* ssl_cert_registry_interval；
+                                                       清单里没写 interval 时用它 */
     time_t                         checked;   /* 上次检查的时间 */
     ngx_file_uniq_t                uniq;      /* 上次加载时文件的 inode */
     time_t                         mtime;     /* 上次加载时文件的修改时间 */
@@ -1743,6 +1745,7 @@ ngx_http_ssl_cert_registry_get(ngx_conf_t *cf,
 
     reg->log = cf->cycle->log;
     reg->interval = mcf->interval;
+    reg->default_interval = mcf->interval;
 
     /* 先 stat 一次：既检查文件存在，也记下状态，用于以后判断是否变化 */
 
@@ -1892,11 +1895,12 @@ ngx_http_ssl_cert_registry_refresh(ngx_http_ssl_cert_registry_t *reg,
         return;
     }
 
-    /* 新清单里的 interval 从下一次检查开始生效 */
+    /*
+     * 新清单里的 interval 从下一次检查开始生效。清单里删掉了 interval 时，
+     * 回落到 ssl_cert_registry_interval，而不是继续沿用上一份清单的值。
+     */
 
-    if (t->interval_set) {
-        reg->interval = t->interval;
-    }
+    reg->interval = t->interval_set ? t->interval : reg->default_interval;
 
     /* 新表建好了才释放旧表，任何时刻都有一张可用的表 */
 

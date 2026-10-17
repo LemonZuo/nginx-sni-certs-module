@@ -252,6 +252,14 @@ check 9447 unknown.test   握手失败
 assert '清单：interval 支持时间字符串' \
     grep -q '"/registry/policy.json" reloaded:.*interval: 2, unmatched: reject' $LOG
 
+# 清单里删掉 interval：应回落到 ssl_cert_registry_interval（这里是 1s），
+# 而不是继续沿用上一份清单的 2
+write_policy_registry '' '"unmatched": "reject",' yes
+sleep 2                                            # 上一份清单的间隔是 2s
+check 9447 a.test         CN=a.test
+assert '清单：删除 interval 后回落到指令值' \
+    sh -c "grep 'policy.json\" reloaded' $LOG | tail -1 | grep -q 'interval: 1,'"
+
 echo "== 热更新：往清单里加入 d.test（不 reload nginx）"
 write_registry yes placeholder
 sleep 2

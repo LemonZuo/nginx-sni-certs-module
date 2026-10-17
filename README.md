@@ -145,6 +145,7 @@ Context: http
 每个 worker 每隔多久检查一次清单文件（inode、修改时间、大小）是否变化，变化了就重新加载。
 
 清单顶层写了 `"interval"` 时，以清单里的值为准（每个清单可以不同）；没有写才用这个指令的值。
+清单里删掉 `"interval"` 后，会回落到这个指令的值。
 
 ### ssl_cert_dir
 
@@ -418,7 +419,8 @@ error.log 里写一条 warn（`... ignored in a server without "ssl_certificate"
 
 - **新清单有任何错误**（JSON 格式、证书读不出来、证书和私钥不匹配、`interval` / `unmatched` 取值非法……），
   整份新清单都不生效，**继续使用旧的证书表**，错误写进 error.log，下一个检查周期再试；
-- 清单顶层的 `interval` 和 `unmatched` 也随清单一起更新；加载失败时旧的检查间隔和策略继续生效；
+- 清单顶层的 `interval` 和 `unmatched` 也随清单一起更新；删掉 `interval` 时回落到
+  `ssl_cert_registry_interval`；加载失败时旧的检查间隔和策略继续生效；
 - 更新清单要**先写临时文件再 `mv` 替换**，避免 worker 读到只写了一半的文件：
 
   ```bash
