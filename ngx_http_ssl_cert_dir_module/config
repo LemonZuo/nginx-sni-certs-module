@@ -1,0 +1,17 @@
+ngx_addon_name=ngx_http_ssl_cert_dir_module
+
+# 依赖 jansson（解析 JSON 证书清单）：
+#   Rocky/RHEL: dnf install jansson-devel    Debian/Ubuntu: apt install libjansson-dev
+#   Alpine:     apk add jansson-dev
+
+if test -n "$ngx_module_link"; then
+    ngx_module_type=HTTP
+    ngx_module_name=ngx_http_ssl_cert_dir_module
+    ngx_module_srcs="$ngx_addon_dir/ngx_http_ssl_cert_dir_module.c"
+    ngx_module_libs="-ljansson"
+    . auto/module
+else
+    HTTP_MODULES="$HTTP_MODULES ngx_http_ssl_cert_dir_module"
+    NGX_ADDON_SRCS="$NGX_ADDON_SRCS $ngx_addon_dir/ngx_http_ssl_cert_dir_module.c"
+    CORE_LIBS="$CORE_LIBS -ljansson"
+fi
