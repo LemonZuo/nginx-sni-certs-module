@@ -54,10 +54,12 @@ chmod 640 /certs/*.key /registry/certs/*.key
 # 证书清单：只记录域名和证书路径，不记录证书内容
 #   $1 = 是否包含 d.test（yes/no）
 #   $2 = 默认证书：placeholder（只当默认的自签名证书）| a（a.test 兼做默认）| two（两条都标默认）| none
+#   $3 = 额外的顶层字段（可选），例如 '"unmatched": "default",'
 write_registry() {
     a_def=""; [ "$2" = a ] || [ "$2" = two ] && a_def=', "isDefault": true'
     {
         echo '{'
+        [ -n "${3:-}" ] && echo "  $3"
         echo '  "certificates": ['
         echo "    { \"domains\": [\"a.test\"],   \"cert\": \"/certs/a.test.crt\", \"key\": \"/certs/a.test.key\"$a_def },"
         echo '    { "domains": ["b.test"],   "cert": "/certs/b.test.crt", "key": "/certs/b.test.key" },'
@@ -75,7 +77,30 @@ write_registry() {
     } > /registry/certs.json.tmp
     mv /registry/certs.json.tmp /registry/certs.json      # 原子替换
 }
+
+# 独立清单：测试 JSON 顶层的 interval / unmatched
+#   $1 = interval 片段，例如 '"interval": 0,'
+#   $2 = unmatched 片段，例如 '"unmatched": "reject",'
+#   $3 = 是否包含 d.test（yes/no）
+write_policy_registry() {
+    {
+        echo '{'
+        [ -n "${1:-}" ] && echo "  $1"
+        [ -n "${2:-}" ] && echo "  $2"
+        echo '  "certificates": ['
+        echo '    { "domains": ["a.test"], "cert": "/certs/a.test.crt", "key": "/certs/a.test.key" }'
+        if [ "${3:-no}" = yes ]; then
+        echo '    , { "domains": ["d.test"], "cert": "certs/d.crt", "key": "certs/d.key" }'
+        fi
+        echo '  ]'
+        echo '}'
+    } > /registry/policy.json.tmp
+    mv /registry/policy.json.tmp /registry/policy.json    # 原子替换
+}
+
 write_registry no placeholder
+# interval 0：每次握手都检查，方便测试；unmatched 由清单决定（server 里没写指令）
+write_policy_registry '"interval": 0,' '"unmatched": "reject",' no
 
 cat > /tmp/ng/conf/nginx.conf <<'EOF'
 load_module modules/ngx_http_ssl_cert_dir_module.so;
@@ -112,6 +137,15 @@ http {
         ssl_certificate_key /certs/default.key;
         ssl_cert_registry   /registry/certs.json;
         ssl_cert_unmatched  reject;
+        return 200 "ok\n";
+    }
+
+    # 清单顶层 interval / unmatched（server 里不写 ssl_cert_unmatched）
+    server {
+        listen 9447 ssl;
+        ssl_certificate     /certs/default.crt;
+        ssl_certificate_key /certs/default.key;
+        ssl_cert_registry   /registry/policy.json;
         return 200 "ok\n";
     }
 }
@@ -186,6 +220,38 @@ assert '拒绝握手没有产生 crit 日志'        sh -c "! grep -q '\[crit\]'
 assert '启动检查：正常配置没有权限警告'    sh -c "! grep -q 'not readable\|not accessible' $LOG"
 assert '启动检查：正常配置没有到期警告'    sh -c "! grep -q 'expires in\|has expired' $LOG"
 
+echo "== 清单顶层的 interval / unmatched"
+check 9447 a.test         CN=a.test
+check 9447 unknown.test   握手失败               # 清单里的 unmatched: reject 生效
+check 9447 "(无SNI)"      握手失败
+
+# 改成 default；interval: 0 让下一次握手立即重新加载，不需要 sleep
+write_policy_registry '"interval": 0,' '"unmatched": "default",' no
+check 9447 unknown.test   CN=default.invalid
+check 9447 "(无SNI)"      CN=default.invalid
+
+# 同样不需要 sleep：往清单里加 d.test 后，下一次握手就能拿到
+write_policy_registry '"interval": 0,' '"unmatched": "default",' yes
+check 9447 d.test         CN=d.test
+
+# 非法的 unmatched / interval：整份清单不生效，继续用旧的证书和策略
+write_policy_registry '"interval": 0,' '"unmatched": "bogus",' yes
+check 9447 a.test         CN=a.test
+assert '清单：非法 unmatched 值被拒绝' \
+    grep -q '"unmatched" must be "default" or "reject"' $LOG
+
+write_policy_registry '"interval": "abc",' '"unmatched": "default",' yes
+check 9447 a.test         CN=a.test
+assert '清单：非法 interval 值被拒绝' \
+    grep -q 'invalid "interval" "abc"' $LOG
+
+# 时间字符串形式
+write_policy_registry '"interval": "2s",' '"unmatched": "reject",' yes
+check 9447 a.test         CN=a.test
+check 9447 unknown.test   握手失败
+assert '清单：interval 支持时间字符串' \
+    grep -q '"/registry/policy.json" reloaded:.*interval: 2, unmatched: reject' $LOG
+
 echo "== 热更新：往清单里加入 d.test（不 reload nginx）"
 write_registry yes placeholder
 sleep 2
@@ -229,6 +295,13 @@ sleep 2
 check 9444 unknown.test   CN=default.invalid
 check 9444 "(无SNI)"      CN=default.invalid
 check 9444 a.test         CN=a.test,O=renewed
+
+echo "== ssl_cert_unmatched 指令优先于清单里的 unmatched"
+# 9445 显式写了 ssl_cert_unmatched reject；清单里写 default 也不应改变它
+write_registry yes none '"unmatched": "default",'
+sleep 2
+check 9445 unknown.test   握手失败               # 指令 reject 优先
+check 9444 unknown.test   CN=default.invalid     # 9444 没写指令，用清单里的 default
 
 echo "== 启动检查：用一份单独的配置跑 nginx -t"
 # worker 以 nobody 运行；这些文件有的它读不到，有的快到期了

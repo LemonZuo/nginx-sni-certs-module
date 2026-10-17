@@ -42,6 +42,7 @@ Context: http
 ```
 
 每个 worker 每隔多久检查一次清单文件（inode、修改时间、大小）是否变化，变化了就重新加载。
+清单顶层写了 `"interval"` 时，以清单里的值为准（每个清单可以不同）；没有写才用这个指令的值。
 
 ```
 Syntax:  ssl_cert_dir path;
@@ -64,6 +65,10 @@ Context: http, server
   `isDefault` 证书此时不起作用。没有 SNI 的客户端（很老的客户端、一些健康检查）也会被拒绝。
 
 只对配置了 `ssl_cert_registry` 或 `ssl_cert_dir` 的 server 生效。
+
+优先级：只要 nginx 配置里显式写了本指令（写在 http{} 或 server{} 都算），就以指令为准；
+没写时使用清单顶层的 `"unmatched"`；清单也没写就是 `default`。
+一个 server 只有一套策略，清单里的策略对目录模式未命中的情况同样生效。
 
 相对路径都按配置文件所在目录解析。server 里必须同时配置 `ssl_certificate`，作为默认证书。
 
@@ -98,6 +103,8 @@ Context: http, server
 
 ```json
 {
+  "interval": 5,
+  "unmatched": "default",
   "certificates": [
     {
       "domains": ["example.com", "www.example.com", "*.example.com"],
@@ -119,6 +126,15 @@ Context: http, server
 }
 ```
 
+顶层还有两个可选字段：
+
+| 顶层字段 | 说明 |
+|---|---|
+| `interval` | 检查间隔。整数表示秒，也可以写成 `"5s"`、`"1m"` 这样的时间字符串；`0` 表示每次握手都检查。覆盖 `ssl_cert_registry_interval` |
+| `unmatched` | `default` 或 `reject`。作为这个清单的默认策略；nginx 配置里显式写了 `ssl_cert_unmatched` 时以指令为准 |
+
+每条证书记录：
+
 | 字段 | 说明 |
 |---|---|
 | `domains` | 必填，非空数组。支持 `*.example.com` 形式的通配符。`isDefault` 为 `true` 时可以省略 |
@@ -136,8 +152,9 @@ Context: http, server
 
 ### 重新加载的规则
 
-- **新清单有任何错误**（JSON 格式、证书读不出来、证书和私钥不匹配……），整份新清单都不生效，**继续使用旧的证书表**，
-  错误写进 error.log，下一个检查周期再试。
+- **新清单有任何错误**（JSON 格式、证书读不出来、证书和私钥不匹配、`interval` / `unmatched` 取值非法……），
+  整份新清单都不生效，**继续使用旧的证书表**，错误写进 error.log，下一个检查周期再试。
+- 清单顶层的 `interval` 和 `unmatched` 也随清单一起更新；加载失败时旧的检查间隔和策略继续生效。
 - 更新清单要**先写临时文件再 `mv` 替换**，避免 worker 读到只写了一半的文件：
 
   ```bash
@@ -253,6 +270,8 @@ NGINX_VERSION=1.31.6 ./test.sh   # 指定版本
 - 目录模式（9443）：精确匹配、RSA / ECDSA 混用、通配符、多级子域名、默认证书、无 SNI、非法 SNI
 - 清单模式（9444）：上面这些，加上一张证书多个域名、相对路径、`enabled: false`、`isDefault` 占位证书
 - `ssl_cert_unmatched reject`（9445）：匹配上的照常，匹配不上 / 无 SNI / 非法 SNI 都拒绝握手，`isDefault` 不起作用
+- 清单顶层配置（9447）：`interval` 支持整数和 `"5s"` 形式、`interval: 0` 时下一次握手即生效；
+  清单里的 `unmatched` 生效；非法取值整份清单不生效；nginx 指令显式配置时优先于清单
 - 匹配不上的 info 日志：三种结尾都有、非法 SNI 里的引号被替换、带客户端地址、没有 crit 日志
 - 启动检查（单独的配置跑 `nginx -t`）：私钥不可读、目录进不去（同一目录只报一次）、
   30 天内到期、已过期、目录模式的证书；`user root` 时不检查权限；正常配置没有误报

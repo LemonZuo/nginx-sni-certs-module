@@ -35,6 +35,10 @@
  * 证书清单格式：
  *
  *   {
+ *     "interval": 5,                           可选，检查间隔（秒或 "5s"/"1m"），
+ *                                              覆盖 ssl_cert_registry_interval
+ *     "unmatched": "default",                  可选，default | reject；没有显式
+ *                                              配置 ssl_cert_unmatched 时生效
  *     "certificates": [
  *       {
  *         "domains": ["example.com", "www.example.com", "*.example.com"],
@@ -190,6 +194,10 @@ typedef struct {
     ngx_array_t                    entries;         /* 所有证书，ngx_http_ssl_cert_entry_t *；
                                                        nelts 就是证书数，启动时检查权限也用它 */
     ngx_uint_t                     ndomains;        /* 登记了多少个域名（用于日志） */
+    ngx_uint_t                     unmatched;       /* 清单顶层 "unmatched" 的值 */
+    ngx_uint_t                     unmatched_set;   /* 清单里是否写了 "unmatched" */
+    time_t                         interval;        /* 清单顶层 "interval" 的值（秒） */
+    ngx_uint_t                     interval_set;    /* 清单里是否写了 "interval" */
 } ngx_http_ssl_cert_table_t;
 
 
@@ -235,6 +243,7 @@ typedef struct {
     ngx_str_t                      dir;            /* ssl_cert_dir */
     ngx_str_t                      registry_path;  /* ssl_cert_registry */
     ngx_uint_t                     unmatched;      /* ssl_cert_unmatched */
+    ngx_uint_t                     unmatched_set;  /* 指令是否显式配置（http 或 server） */
     ngx_http_ssl_cert_registry_t  *registry;       /* 在 postconfiguration 里关联上 */
 } ngx_http_ssl_cert_dir_srv_conf_t;
 
@@ -290,6 +299,8 @@ static ngx_int_t ngx_http_ssl_cert_dir_load(ngx_ssl_conn_t *ssl_conn,
 
 /* 证书清单 */
 
+static const char *ngx_http_ssl_cert_unmatched_name(
+    ngx_http_ssl_cert_table_t *t);
 static ngx_http_ssl_cert_registry_t *ngx_http_ssl_cert_registry_get(
     ngx_conf_t *cf, ngx_http_ssl_cert_dir_main_conf_t *mcf, ngx_str_t *path);
 static void ngx_http_ssl_cert_registry_cleanup(void *data);
@@ -542,7 +553,15 @@ ngx_http_ssl_cert_dir_merge_srv_conf(ngx_conf_t *cf, void *parent,
     ngx_conf_merge_str_value(conf->dir, prev->dir, "");
     ngx_conf_merge_str_value(conf->registry_path, prev->registry_path, "");
 
-    /* 数字类型以 NGX_CONF_UNSET_UINT 表示没配置；都没配置时默认 default */
+    /*
+     * 数字类型以 NGX_CONF_UNSET_UINT 表示没配置；都没配置时默认 default。
+     *
+     * 同时记下"http 或 server 里到底有没有显式写"，供握手时判断
+     * 清单里的 "unmatched" 是否生效：指令显式配置时优先于清单。
+     */
+
+    conf->unmatched_set = (conf->unmatched != NGX_CONF_UNSET_UINT
+                           || prev->unmatched != NGX_CONF_UNSET_UINT);
 
     ngx_conf_merge_uint_value(conf->unmatched, prev->unmatched,
                               NGX_HTTP_SSL_CERT_UNMATCHED_DEFAULT);
@@ -1274,6 +1293,7 @@ ngx_http_ssl_cert_dir_cert_cb(ngx_ssl_conn_t *ssl_conn, void *arg)
     u_char                     *dot, *shown, ch;
     size_t                      i;
     ngx_int_t                   rc;
+    ngx_uint_t                  unmatched;
     const char                 *sni;
     ngx_connection_t           *c;
     ngx_http_ssl_cert_entry_t  *e;
@@ -1296,6 +1316,18 @@ ngx_http_ssl_cert_dir_cert_cb(ngx_ssl_conn_t *ssl_conn, void *arg)
     if (cdcf->registry) {
         ngx_http_ssl_cert_registry_refresh(cdcf->registry, c->log);
         table = cdcf->registry->table;
+    }
+
+    /*
+     * 未匹配时的策略：nginx 配置里显式写了 ssl_cert_unmatched（http 或
+     * server）就以指令为准；否则用清单顶层的 "unmatched"；都没有就是
+     * default。一个 server 只有一套策略，目录模式未命中也按它处理。
+     */
+
+    unmatched = cdcf->unmatched;
+
+    if (!cdcf->unmatched_set && table && table->unmatched_set) {
+        unmatched = table->unmatched;
     }
 
     /* 客户端在 ClientHello 里发来的域名，没有发就是 NULL */
@@ -1387,7 +1419,7 @@ unmatched:
      * 日志级别不够时 ngx_log_error 在宏里就直接跳过了，没有开销。
      */
 
-    if (cdcf->unmatched == NGX_HTTP_SSL_CERT_UNMATCHED_REJECT) {
+    if (unmatched == NGX_HTTP_SSL_CERT_UNMATCHED_REJECT) {
         action = "handshake rejected";
 
     } else if (table && table->default_entry) {
@@ -1412,7 +1444,7 @@ unmatched:
      * 不会因为扫描器大量访问而刷屏
      */
 
-    if (cdcf->unmatched == NGX_HTTP_SSL_CERT_UNMATCHED_REJECT) {
+    if (unmatched == NGX_HTTP_SSL_CERT_UNMATCHED_REJECT) {
         return 0;
     }
 
@@ -1628,6 +1660,20 @@ ngx_http_ssl_cert_dir_load(ngx_ssl_conn_t *ssl_conn, ngx_connection_t *c,
 /* 证书清单                                                               */
 /* ---------------------------------------------------------------------- */
 
+/* 日志用：清单里 "unmatched" 的值；没写时由 nginx 配置决定 */
+
+static const char *
+ngx_http_ssl_cert_unmatched_name(ngx_http_ssl_cert_table_t *t)
+{
+    if (!t->unmatched_set) {
+        return "from config";
+    }
+
+    return (t->unmatched == NGX_HTTP_SSL_CERT_UNMATCHED_REJECT)
+           ? "reject" : "default";
+}
+
+
 /*
  * 配置阶段：取得（或创建并首次加载）某个清单文件对应的 registry。
  * 首次加载在 master 进程里完成，失败会让 nginx -t / 启动直接报错。
@@ -1717,6 +1763,12 @@ ngx_http_ssl_cert_registry_get(ngx_conf_t *cf,
         return NULL;
     }
 
+    /* 清单里写了 interval 就覆盖 ssl_cert_registry_interval 的值 */
+
+    if (reg->table->interval_set) {
+        reg->interval = reg->table->interval;
+    }
+
     reg->uniq = ngx_file_uniq(&fi);
     reg->mtime = ngx_file_mtime(&fi);
     reg->size = ngx_file_size(&fi);
@@ -1744,10 +1796,12 @@ ngx_http_ssl_cert_registry_get(ngx_conf_t *cf,
 
     ngx_log_error(NGX_LOG_NOTICE, cf->log, 0,
                   "ssl_cert_registry: \"%V\" loaded: %ui certificates, "
-                  "%ui domains, default: %s", &reg->path,
-                  reg->table->entries.nelts,
+                  "%ui domains, default: %s, interval: %i, unmatched: %s",
+                  &reg->path, reg->table->entries.nelts,
                   reg->table->ndomains,
-                  reg->table->default_entry ? "yes" : "no");
+                  reg->table->default_entry ? "yes" : "no",
+                  (ngx_int_t) reg->interval,
+                  ngx_http_ssl_cert_unmatched_name(reg->table));
 
     return reg;
 }
@@ -1838,6 +1892,12 @@ ngx_http_ssl_cert_registry_refresh(ngx_http_ssl_cert_registry_t *reg,
         return;
     }
 
+    /* 新清单里的 interval 从下一次检查开始生效 */
+
+    if (t->interval_set) {
+        reg->interval = t->interval;
+    }
+
     /* 新表建好了才释放旧表，任何时刻都有一张可用的表 */
 
     if (reg->table) {
@@ -1851,8 +1911,11 @@ ngx_http_ssl_cert_registry_refresh(ngx_http_ssl_cert_registry_t *reg,
 
     ngx_log_error(NGX_LOG_NOTICE, log, 0,
                   "ssl_cert_registry: \"%V\" reloaded: %ui certificates, "
-                  "%ui domains, default: %s", &reg->path, t->entries.nelts,
-                  t->ndomains, t->default_entry ? "yes" : "no");
+                  "%ui domains, default: %s, interval: %i, unmatched: %s",
+                  &reg->path, t->entries.nelts, t->ndomains,
+                  t->default_entry ? "yes" : "no",
+                  (ngx_int_t) reg->interval,
+                  ngx_http_ssl_cert_unmatched_name(t));
 }
 
 
@@ -1879,7 +1942,9 @@ ngx_http_ssl_cert_registry_build(ngx_http_ssl_cert_registry_t *reg,
                                *enabled, *isdef;
     ngx_int_t                   rc;
     ngx_uint_t                  is_default;
-    ngx_str_t                   name;
+    json_int_t                  n;
+    ngx_int_t                   tt;
+    ngx_str_t                   name, tv;
     const char                 *s;
     json_error_t                jerr;
     ngx_pool_t                 *pool, *temp_pool;
@@ -1956,6 +2021,93 @@ ngx_http_ssl_cert_registry_build(ngx_http_ssl_cert_registry_t *reg,
 
     if (ngx_hash_keys_array_init(&ha, NGX_HASH_SMALL) != NGX_OK) {
         goto failed;
+    }
+
+    /*
+     * 顶层可选配置：
+     *
+     *   "interval"   检查间隔。整数表示秒，也可以写成 "5s"、"1m" 这样的
+     *                时间字符串；覆盖 ssl_cert_registry_interval。
+     *   "unmatched"  未匹配时的默认策略，default 或 reject；只在 nginx
+     *                配置里没有显式写 ssl_cert_unmatched 时生效。
+     *
+     * 两个字段都要求类型和取值合法，否则整份清单不生效。
+     */
+
+    value = json_object_get(root, "interval");
+
+    if (value != NULL) {
+
+        if (json_is_integer(value)) {
+
+            n = json_integer_value(value);
+
+            if (n < 0 || (json_int_t) (time_t) n != n) {
+                ngx_log_error(NGX_LOG_ERR, log, 0,
+                              "ssl_cert_registry: \"%V\": \"interval\" "
+                              "must be a non-negative number of seconds",
+                              &reg->path);
+                goto failed;
+            }
+
+            t->interval = (time_t) n;
+
+        } else if (json_is_string(value)) {
+
+            s = json_string_value(value);
+
+            tv.len = ngx_strlen(s);
+            tv.data = (u_char *) s;
+            tt = ngx_parse_time(&tv, 1);
+
+            if (tt == NGX_ERROR) {
+                ngx_log_error(NGX_LOG_ERR, log, 0,
+                              "ssl_cert_registry: \"%V\": invalid "
+                              "\"interval\" \"%s\"", &reg->path, s);
+                goto failed;
+            }
+
+            t->interval = tt;
+
+        } else {
+            ngx_log_error(NGX_LOG_ERR, log, 0,
+                          "ssl_cert_registry: \"%V\": \"interval\" must be "
+                          "an integer or a time string such as \"5s\"",
+                          &reg->path);
+            goto failed;
+        }
+
+        t->interval_set = 1;
+    }
+
+    value = json_object_get(root, "unmatched");
+
+    if (value != NULL) {
+
+        s = json_string_value(value);
+
+        if (s == NULL) {
+            ngx_log_error(NGX_LOG_ERR, log, 0,
+                          "ssl_cert_registry: \"%V\": \"unmatched\" must be "
+                          "\"default\" or \"reject\"", &reg->path);
+            goto failed;
+        }
+
+        if (ngx_strcmp(s, "default") == 0) {
+            t->unmatched = NGX_HTTP_SSL_CERT_UNMATCHED_DEFAULT;
+
+        } else if (ngx_strcmp(s, "reject") == 0) {
+            t->unmatched = NGX_HTTP_SSL_CERT_UNMATCHED_REJECT;
+
+        } else {
+            ngx_log_error(NGX_LOG_ERR, log, 0,
+                          "ssl_cert_registry: \"%V\": \"unmatched\" must be "
+                          "\"default\" or \"reject\", got \"%s\"",
+                          &reg->path, s);
+            goto failed;
+        }
+
+        t->unmatched_set = 1;
     }
 
     /* 3. 逐条处理；json_array_foreach 是 jansson 提供的遍历宏，i 是下标 */
