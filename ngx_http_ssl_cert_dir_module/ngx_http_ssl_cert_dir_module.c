@@ -1,45 +1,42 @@
 /*
  * ngx_http_ssl_cert_dir_module
  *
- * 在 TLS 握手时，按客户端请求的域名（SNI）选择证书。查找顺序：
+ * 在 TLS 握手时，按客户端请求的域名（SNI）选择证书。整个模块只有一条指令
+ * ssl_cert_registry，指向一份 JSON 清单；证书从哪来、怎么匹配、多久检查一次，
+ * 全部写在清单里。查找顺序：
  *
- *   1. 证书清单（ssl_cert_registry，JSON 文件）：
+ *   1. 清单里的证书（"certificates"）：
  *        精确域名 -> "*.上一级域名"（只向上找一级，与 TLS 通配符语义一致）
- *   2. 证书目录（ssl_cert_dir）：
+ *   2. 证书目录（清单里的 "directory"）：
  *        <dir>/<域名>.crt -> <dir>/wildcard.<上一级域名>.crt
- *   3. 证书清单里 "isDefault": true 的证书
+ *   3. 清单里 "isDefault": true 的证书
  *   4. server 块里 ssl_certificate 配置的证书
  *
  * 没有 SNI 或 SNI 不合法时，直接从第 3 步开始。前两步都没匹配上时写一条
- * info 日志；配置了 ssl_cert_unmatched reject 时不走第 3、4 步，直接拒绝握手。
+ * info 日志；清单里写了 "unmatched": "reject" 时不走第 3、4 步，直接拒绝握手。
  *
- * 证书清单在启动时整体读入内存，握手时不读磁盘。每个 worker 每隔
- * ssl_cert_registry_interval 检查一次清单文件，变化了就重新加载；
- * 新清单有任何错误时继续使用旧的证书表。
+ * 清单在启动时整体读入内存，清单里的证书握手时不读磁盘。每个 worker 每隔
+ * 清单里的 "interval" 秒检查一次清单文件，变化了就重新加载；新清单有任何
+ * 错误时继续使用旧的证书表。
  *
  * 用法：
  *
- *   http {
- *       ssl_cert_registry_interval 5s;
- *
- *       server {
- *           listen 443 ssl;
- *           ssl_certificate     certs/default.crt;
- *           ssl_certificate_key certs/default.key;
- *           ssl_cert_registry   /path/to/certs.json;
- *           ssl_cert_dir        /path/to/certs;        # 可选
- *           ssl_cert_unmatched  default;               # 可选，default | reject
- *       }
+ *   server {
+ *       listen 443 ssl;
+ *       ssl_certificate     certs/default.crt;     # nginx 强制要求
+ *       ssl_certificate_key certs/default.key;
+ *       ssl_cert_registry   /path/to/certs.json;   # 唯一的模块指令
  *   }
  *
  * 证书清单格式：
  *
  *   {
  *     "interval": 5,                           可选，检查间隔（秒或 "5s"/"1m"），
- *                                              覆盖 ssl_cert_registry_interval
- *     "unmatched": "default",                  可选，default | reject；没有显式
- *                                              配置 ssl_cert_unmatched 时生效
- *     "certificates": [
+ *                                              默认 5，0 表示每次握手都检查
+ *     "unmatched": "default",                  可选，default | reject，默认 default
+ *     "directory": "certs",                    可选，证书目录；相对路径按清单文件
+ *                                              所在目录解析
+ *     "certificates": [                        可选，但和 "directory" 至少有一个
  *       {
  *         "domains": ["example.com", "www.example.com", "*.example.com"],
  *         "cert": "example.com/fullchain.pem",   相对路径按清单文件所在目录解析
@@ -50,6 +47,9 @@
  *       }
  *     ]
  *   }
+ *
+ * 因为策略和目录都写在清单里，同一份清单被多个 server 引用时，它们共用
+ * 同一套策略和目录；需要区分就拆成多份清单。
  *
  * 限制：
  *   - 不要和使用变量的 ssl_certificate 同时用（两者都会设置 cert_cb）；
@@ -80,7 +80,7 @@
  *     └─ master 进程（root）解析配置
  *          ├─ create_main_conf / create_srv_conf   为每一层配置分配结构体
  *          ├─ 解析指令，写入结构体                 ngx_conf_set_*_slot
- *          ├─ init_main_conf / merge_srv_conf      填默认值、把 http{} 的值继承到 server{}
+ *          ├─ merge_srv_conf                       把 http{} 的值继承到 server{}
  *          ├─ postconfiguration（本模块的 init）
  *          │    ├─ 首次加载 JSON 清单，证书读进内存（master 是 root，权限不是问题）
  *          │    └─ SSL_CTX_set_cert_cb()           给每个相关 server 的 SSL_CTX 挂回调
@@ -156,7 +156,12 @@
 #define NGX_HTTP_SSL_CERT_EXPIRE_WARN_DAYS  30
 
 
-/* ssl_cert_unmatched 的取值 */
+/* 清单里没有写 "interval" 时的检查间隔（秒） */
+
+#define NGX_HTTP_SSL_CERT_DEFAULT_INTERVAL  5
+
+
+/* 清单里 unmatched 的取值 */
 
 #define NGX_HTTP_SSL_CERT_UNMATCHED_DEFAULT  0   /* 使用默认证书 */
 #define NGX_HTTP_SSL_CERT_UNMATCHED_REJECT   1   /* 拒绝握手 */
@@ -194,6 +199,8 @@ typedef struct {
     ngx_array_t                    entries;         /* 所有证书，ngx_http_ssl_cert_entry_t *；
                                                        nelts 就是证书数，启动时检查权限也用它 */
     ngx_uint_t                     ndomains;        /* 登记了多少个域名（用于日志） */
+    ngx_str_t                      dir;             /* 清单顶层 "directory"，已解析成
+                                                       完整路径；len 为 0 表示不启用目录模式 */
     ngx_uint_t                     unmatched;       /* 清单顶层 "unmatched" 的值 */
     ngx_uint_t                     unmatched_set;   /* 清单里是否写了 "unmatched" */
     time_t                         interval;        /* 清单顶层 "interval" 的值（秒） */
@@ -213,8 +220,6 @@ typedef struct {
     ngx_str_t                      dir;       /* 清单文件所在目录（指向 path 的前半部分） */
     ngx_log_t                     *log;       /* 创建内存池用的日志对象（cycle 的日志） */
     time_t                         interval;  /* 当前生效的检查间隔，秒 */
-    time_t                         default_interval; /* ssl_cert_registry_interval；
-                                                       清单里没写 interval 时用它 */
     time_t                         checked;   /* 上次检查的时间 */
     ngx_file_uniq_t                uniq;      /* 上次加载时文件的 inode */
     time_t                         mtime;     /* 上次加载时文件的修改时间 */
@@ -230,9 +235,8 @@ typedef struct {
 typedef struct {
     ngx_array_t                    registries;  /* ngx_http_ssl_cert_registry_t *，
                                                    按路径去重，所有清单都在这里 */
-    ngx_array_t                    dirs;        /* ngx_str_t，按路径去重，所有证书目录，
-                                                   启动时检查用 */
-    time_t                         interval;    /* ssl_cert_registry_interval */
+    ngx_array_t                    dirs;        /* ngx_str_t，按路径去重，清单里配置的
+                                                   所有证书目录，启动时检查用 */
 } ngx_http_ssl_cert_dir_main_conf_t;
 
 
@@ -242,10 +246,7 @@ typedef struct {
  */
 
 typedef struct {
-    ngx_str_t                      dir;            /* ssl_cert_dir */
     ngx_str_t                      registry_path;  /* ssl_cert_registry */
-    ngx_uint_t                     unmatched;      /* ssl_cert_unmatched */
-    ngx_uint_t                     unmatched_set;  /* 指令是否显式配置（http 或 server） */
     ngx_http_ssl_cert_registry_t  *registry;       /* 在 postconfiguration 里关联上 */
 } ngx_http_ssl_cert_dir_srv_conf_t;
 
@@ -267,8 +268,6 @@ typedef struct {
 /* 配置阶段（master 进程解析配置时调用） */
 
 static void *ngx_http_ssl_cert_dir_create_main_conf(ngx_conf_t *cf);
-static char *ngx_http_ssl_cert_dir_init_main_conf(ngx_conf_t *cf,
-    void *conf);
 static void *ngx_http_ssl_cert_dir_create_srv_conf(ngx_conf_t *cf);
 static char *ngx_http_ssl_cert_dir_merge_srv_conf(ngx_conf_t *cf,
     void *parent, void *child);
@@ -313,6 +312,9 @@ static ngx_http_ssl_cert_table_t *ngx_http_ssl_cert_registry_build(
 static ngx_int_t ngx_http_ssl_cert_registry_path(
     ngx_http_ssl_cert_registry_t *reg, json_t *value, u_char *buf,
     ngx_log_t *log, size_t index, char *field);
+static ngx_int_t ngx_http_ssl_cert_registry_dir(
+    ngx_http_ssl_cert_registry_t *reg, json_t *root,
+    ngx_http_ssl_cert_table_t *t, ngx_pool_t *pool, ngx_log_t *log);
 static ngx_http_ssl_cert_entry_t *ngx_http_ssl_cert_registry_find(
     ngx_http_ssl_cert_table_t *t, u_char *name);
 static ngx_int_t ngx_http_ssl_cert_entry_load(ngx_log_t *log, u_char *crt,
@@ -341,47 +343,21 @@ static void ngx_http_ssl_cert_entry_cleanup(void *data);
  *   post    额外参数：enum_slot 用它传可选值列表，其他指令不需要
  */
 
-/* ssl_cert_unmatched 的可选值：配置里写的词 -> 存进配置的数字 */
-
-static ngx_conf_enum_t  ngx_http_ssl_cert_unmatched[] = {
-    { ngx_string("default"), NGX_HTTP_SSL_CERT_UNMATCHED_DEFAULT },
-    { ngx_string("reject"), NGX_HTTP_SSL_CERT_UNMATCHED_REJECT },
-    { ngx_null_string, 0 }
-};
-
+/*
+ * 整个模块只有这一条指令：指向 JSON 清单，其余配置（证书目录、检查间隔、
+ * 未匹配策略）都写在清单里。
+ *
+ * 因为清单里的策略和目录是清单自己的属性，同一份清单被多个 server 引用时
+ * 它们共用同一套配置；需要区分就拆成多份清单。
+ */
 
 static ngx_command_t  ngx_http_ssl_cert_dir_commands[] = {
-
-    { ngx_string("ssl_cert_dir"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
-      ngx_conf_set_str_slot,
-      NGX_HTTP_SRV_CONF_OFFSET,
-      offsetof(ngx_http_ssl_cert_dir_srv_conf_t, dir),
-      NULL },
 
     { ngx_string("ssl_cert_registry"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_str_slot,
       NGX_HTTP_SRV_CONF_OFFSET,
       offsetof(ngx_http_ssl_cert_dir_srv_conf_t, registry_path),
-      NULL },
-
-    /* 匹配不上时怎么办：default 使用默认证书，reject 拒绝握手 */
-
-    { ngx_string("ssl_cert_unmatched"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
-      ngx_conf_set_enum_slot,
-      NGX_HTTP_SRV_CONF_OFFSET,
-      offsetof(ngx_http_ssl_cert_dir_srv_conf_t, unmatched),
-      &ngx_http_ssl_cert_unmatched },
-
-    /* 只能写在 http{} 里，存到 main conf */
-
-    { ngx_string("ssl_cert_registry_interval"),
-      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
-      ngx_conf_set_sec_slot,
-      NGX_HTTP_MAIN_CONF_OFFSET,
-      offsetof(ngx_http_ssl_cert_dir_main_conf_t, interval),
       NULL },
 
       ngx_null_command                     /* 数组结束标记 */
@@ -395,7 +371,7 @@ static ngx_command_t  ngx_http_ssl_cert_dir_commands[] = {
  *   preconfiguration    解析 http{} 之前
  *   create_*_conf       进入每一层配置块时，为本模块分配配置结构体
  *   （解析指令）
- *   init_main_conf      http{} 解析完，给 main conf 填默认值
+ *   （init_main_conf 本模块不需要，对应位置填 NULL）
  *   merge_srv_conf      把 http{} 层的值继承给每个 server{}
  *   postconfiguration   所有配置都处理完之后，适合做"跨模块"的初始化
  *
@@ -407,7 +383,7 @@ static ngx_http_module_t  ngx_http_ssl_cert_dir_module_ctx = {
     ngx_http_ssl_cert_dir_init,             /* postconfiguration */
 
     ngx_http_ssl_cert_dir_create_main_conf, /* create main configuration */
-    ngx_http_ssl_cert_dir_init_main_conf,   /* init main configuration */
+    NULL,                                   /* init main configuration */
 
     ngx_http_ssl_cert_dir_create_srv_conf,  /* create server configuration */
     ngx_http_ssl_cert_dir_merge_srv_conf,   /* merge server configuration */
@@ -451,8 +427,8 @@ ngx_module_t  ngx_http_ssl_cert_dir_module = {
 /*
  * 创建 http{} 级别的配置结构体（每个 http 块调用一次）
  *
- * 字段先设成 NGX_CONF_UNSET（"没有配置"），等 init_main_conf 时再判断：
- * 用户没写就填默认值。这是 nginx 配置的标准写法。
+ * 本模块没有 http 级指令，这里只需要两个去重用的数组：所有清单，
+ * 以及清单里配置的所有证书目录（启动检查时要扫描）。
  */
 
 static void *
@@ -480,26 +456,7 @@ ngx_http_ssl_cert_dir_create_main_conf(ngx_conf_t *cf)
         return NULL;
     }
 
-    mcf->interval = NGX_CONF_UNSET;
-
     return mcf;
-}
-
-
-/*
- * http{} 解析完之后调用：没有配置 ssl_cert_registry_interval 时，默认 5 秒
- */
-
-static char *
-ngx_http_ssl_cert_dir_init_main_conf(ngx_conf_t *cf, void *conf)
-{
-    ngx_http_ssl_cert_dir_main_conf_t  *mcf = conf;
-
-    /* 值还是 NGX_CONF_UNSET 时才设成默认值 */
-
-    ngx_conf_init_value(mcf->interval, 5);
-
-    return NGX_CONF_OK;
 }
 
 
@@ -523,12 +480,9 @@ ngx_http_ssl_cert_dir_create_srv_conf(ngx_conf_t *cf)
     /*
      * set by ngx_pcalloc():
      *
-     *     conf->dir = { 0, NULL };
      *     conf->registry_path = { 0, NULL };
      *     conf->registry = NULL;
      */
-
-    conf->unmatched = NGX_CONF_UNSET_UINT;
 
     return conf;
 }
@@ -552,21 +506,7 @@ ngx_http_ssl_cert_dir_merge_srv_conf(ngx_conf_t *cf, void *parent,
      * 子级没配置就用父级的，父级也没配置就用默认值 ""
      */
 
-    ngx_conf_merge_str_value(conf->dir, prev->dir, "");
     ngx_conf_merge_str_value(conf->registry_path, prev->registry_path, "");
-
-    /*
-     * 数字类型以 NGX_CONF_UNSET_UINT 表示没配置；都没配置时默认 default。
-     *
-     * 同时记下"http 或 server 里到底有没有显式写"，供握手时判断
-     * 清单里的 "unmatched" 是否生效：指令显式配置时优先于清单。
-     */
-
-    conf->unmatched_set = (conf->unmatched != NGX_CONF_UNSET_UINT
-                           || prev->unmatched != NGX_CONF_UNSET_UINT);
-
-    ngx_conf_merge_uint_value(conf->unmatched, prev->unmatched,
-                              NGX_HTTP_SSL_CERT_UNMATCHED_DEFAULT);
 
     /* 相对路径按配置文件所在目录解析，和 ssl_certificate 一致 */
 
@@ -574,12 +514,6 @@ ngx_http_ssl_cert_dir_merge_srv_conf(ngx_conf_t *cf, void *parent,
      * ngx_conf_full_name() 的第三个参数为 1 表示相对于配置目录（conf/），
      * 为 0 表示相对于安装目录（--prefix）。已经是绝对路径时原样保留。
      */
-
-    if (conf->dir.len
-        && ngx_conf_full_name(cf->cycle, &conf->dir, 1) != NGX_OK)
-    {
-        return NGX_CONF_ERROR;
-    }
 
     if (conf->registry_path.len
         && ngx_conf_full_name(cf->cycle, &conf->registry_path, 1) != NGX_OK)
@@ -630,9 +564,9 @@ ngx_http_ssl_cert_dir_init(ngx_conf_t *cf)
 
         cdcf = cscfp[s]->ctx->srv_conf[ngx_http_ssl_cert_dir_module.ctx_index];
 
-        /* 这个 server 没用本模块的任何指令，跳过 */
+        /* 这个 server 没用本模块的指令，跳过 */
 
-        if (cdcf->dir.len == 0 && cdcf->registry_path.len == 0) {
+        if (cdcf->registry_path.len == 0) {
             continue;
         }
 
@@ -645,29 +579,34 @@ ngx_http_ssl_cert_dir_init(ngx_conf_t *cf)
 
         if (sscf->ssl.ctx == NULL) {
             ngx_log_error(NGX_LOG_WARN, cf->log, 0,
-                          "\"ssl_cert_dir\" and \"ssl_cert_registry\" are "
-                          "ignored in a server without \"ssl_certificate\"");
+                          "\"ssl_cert_registry\" is ignored in a server "
+                          "without \"ssl_certificate\"");
             continue;
         }
 
         /* 同一个清单文件只加载一次，多个 server 共用 */
 
-        if (cdcf->registry_path.len) {
-            cdcf->registry = ngx_http_ssl_cert_registry_get(cf, mcf,
-                                                         &cdcf->registry_path);
-            if (cdcf->registry == NULL) {
-                return NGX_ERROR;
-            }
+        cdcf->registry = ngx_http_ssl_cert_registry_get(cf, mcf,
+                                                        &cdcf->registry_path);
+        if (cdcf->registry == NULL) {
+            return NGX_ERROR;
         }
 
-        /* 记下证书目录（去重），启动检查时要扫描 */
+        /*
+         * 清单里配了证书目录就记下来（去重），启动检查时要扫描。
+         *
+         * 这里记的是启动那一刻的目录；运行中清单改了 directory 的话，
+         * 只会影响启动检查的覆盖面，握手时用的始终是清单里的新值。
+         */
 
-        if (cdcf->dir.len) {
+        if (cdcf->registry->table->dir.len) {
             dir = mcf->dirs.elts;
 
             for (i = 0; i < mcf->dirs.nelts; i++) {
-                if (dir[i].len == cdcf->dir.len
-                    && ngx_strncmp(dir[i].data, cdcf->dir.data, dir[i].len)
+                if (dir[i].len == cdcf->registry->table->dir.len
+                    && ngx_strncmp(dir[i].data,
+                                   cdcf->registry->table->dir.data,
+                                   dir[i].len)
                        == 0)
                 {
                     break;
@@ -680,7 +619,7 @@ ngx_http_ssl_cert_dir_init(ngx_conf_t *cf)
                     return NGX_ERROR;
                 }
 
-                *dir = cdcf->dir;
+                *dir = cdcf->registry->table->dir;
             }
         }
 
@@ -1279,7 +1218,7 @@ ngx_http_ssl_cert_check_expiry(ngx_log_t *log, X509 *cert, u_char *path,
  *          ├─ 1. 清单：精确匹配 → "*.上一级域名" ─────────→ 找到就用
  *          ├─ 2. 目录：<域名>.crt → wildcard.<上一级>.crt ─→ 找到就用
  *          └─ 都没找到 ─────────────────────────────────────→ 匹配不上
- *   匹配不上：写一条 info 日志，然后看 ssl_cert_unmatched
+ *   匹配不上：写一条 info 日志，然后看清单里的 unmatched
  *     ├─ reject   拒绝握手
  *     └─ default  使用默认证书
  *          ├─ 3. 清单里 isDefault 的证书
@@ -1296,6 +1235,7 @@ ngx_http_ssl_cert_dir_cert_cb(ngx_ssl_conn_t *ssl_conn, void *arg)
     size_t                      i;
     ngx_int_t                   rc;
     ngx_uint_t                  unmatched;
+    ngx_str_t                  *dir;
     const char                 *sni;
     ngx_connection_t           *c;
     ngx_http_ssl_cert_entry_t  *e;
@@ -1321,16 +1261,15 @@ ngx_http_ssl_cert_dir_cert_cb(ngx_ssl_conn_t *ssl_conn, void *arg)
     }
 
     /*
-     * 未匹配时的策略：nginx 配置里显式写了 ssl_cert_unmatched（http 或
-     * server）就以指令为准；否则用清单顶层的 "unmatched"；都没有就是
-     * default。一个 server 只有一套策略，目录模式未命中也按它处理。
+     * 未匹配时的策略和证书目录都来自清单。策略是清单的属性，所以同一份
+     * 清单被多个 server 引用时，它们共用同一套策略。
      */
 
-    unmatched = cdcf->unmatched;
+    unmatched = (table != NULL && table->unmatched_set)
+                ? table->unmatched
+                : NGX_HTTP_SSL_CERT_UNMATCHED_DEFAULT;
 
-    if (!cdcf->unmatched_set && table && table->unmatched_set) {
-        unmatched = table->unmatched;
-    }
+    dir = (table != NULL) ? &table->dir : NULL;
 
     /* 客户端在 ClientHello 里发来的域名，没有发就是 NULL */
 
@@ -1377,11 +1316,11 @@ ngx_http_ssl_cert_dir_cert_cb(ngx_ssl_conn_t *ssl_conn, void *arg)
 
     /* 2. 证书目录 */
 
-    if (cdcf->dir.len) {
+    if (dir != NULL && dir->len) {
 
         /* 先找 <dir>/<域名>.crt */
 
-        rc = ngx_http_ssl_cert_dir_load(ssl_conn, c, &cdcf->dir, name);
+        rc = ngx_http_ssl_cert_dir_load(ssl_conn, c, dir, name);
 
         /* 找到了（成功或失败）就不再往下找；只有"文件不存在"才继续 */
 
@@ -1402,7 +1341,7 @@ ngx_http_ssl_cert_dir_cert_cb(ngx_ssl_conn_t *ssl_conn, void *arg)
 
             ngx_sprintf(base, "wildcard.%s%Z", dot + 1);
 
-            rc = ngx_http_ssl_cert_dir_load(ssl_conn, c, &cdcf->dir, base);
+            rc = ngx_http_ssl_cert_dir_load(ssl_conn, c, dir, base);
 
             if (rc != NGX_DECLINED) {
                 return (rc == NGX_OK) ? 1 : 0;
@@ -1441,7 +1380,7 @@ unmatched:
     }
 
     /*
-     * ssl_cert_unmatched reject：返回 0，OpenSSL 给客户端发送 internal_error
+     * unmatched 为 reject：返回 0，OpenSSL 给客户端发送 internal_error
      * 告警并结束握手。nginx 把这种握手失败（"cert cb error"）记为 info 级别，
      * 不会因为扫描器大量访问而刷屏
      */
@@ -1662,13 +1601,13 @@ ngx_http_ssl_cert_dir_load(ngx_ssl_conn_t *ssl_conn, ngx_connection_t *c,
 /* 证书清单                                                               */
 /* ---------------------------------------------------------------------- */
 
-/* 日志用：清单里 "unmatched" 的值；没写时由 nginx 配置决定 */
+/* 日志用：清单里 "unmatched" 的值 */
 
 static const char *
 ngx_http_ssl_cert_unmatched_name(ngx_http_ssl_cert_table_t *t)
 {
     if (!t->unmatched_set) {
-        return "from config";
+        return "default";
     }
 
     return (t->unmatched == NGX_HTTP_SSL_CERT_UNMATCHED_REJECT)
@@ -1744,8 +1683,7 @@ ngx_http_ssl_cert_registry_get(ngx_conf_t *cf,
      */
 
     reg->log = cf->cycle->log;
-    reg->interval = mcf->interval;
-    reg->default_interval = mcf->interval;
+    reg->interval = NGX_HTTP_SSL_CERT_DEFAULT_INTERVAL;
 
     /* 先 stat 一次：既检查文件存在，也记下状态，用于以后判断是否变化 */
 
@@ -1766,7 +1704,7 @@ ngx_http_ssl_cert_registry_get(ngx_conf_t *cf,
         return NULL;
     }
 
-    /* 清单里写了 interval 就覆盖 ssl_cert_registry_interval 的值 */
+    /* 清单里写了 interval 就用它，否则用内置默认值 */
 
     if (reg->table->interval_set) {
         reg->interval = reg->table->interval;
@@ -1799,10 +1737,12 @@ ngx_http_ssl_cert_registry_get(ngx_conf_t *cf,
 
     ngx_log_error(NGX_LOG_NOTICE, cf->log, 0,
                   "ssl_cert_registry: \"%V\" loaded: %ui certificates, "
-                  "%ui domains, default: %s, interval: %i, unmatched: %s",
+                  "%ui domains, default: %s, directory: %s, interval: %i, "
+                  "unmatched: %s",
                   &reg->path, reg->table->entries.nelts,
                   reg->table->ndomains,
                   reg->table->default_entry ? "yes" : "no",
+                  reg->table->dir.len ? (char *) reg->table->dir.data : "no",
                   (ngx_int_t) reg->interval,
                   ngx_http_ssl_cert_unmatched_name(reg->table));
 
@@ -1897,10 +1837,11 @@ ngx_http_ssl_cert_registry_refresh(ngx_http_ssl_cert_registry_t *reg,
 
     /*
      * 新清单里的 interval 从下一次检查开始生效。清单里删掉了 interval 时，
-     * 回落到 ssl_cert_registry_interval，而不是继续沿用上一份清单的值。
+     * 回落到内置默认值，而不是继续沿用上一份清单的值。
      */
 
-    reg->interval = t->interval_set ? t->interval : reg->default_interval;
+    reg->interval = t->interval_set ? t->interval
+                                    : NGX_HTTP_SSL_CERT_DEFAULT_INTERVAL;
 
     /* 新表建好了才释放旧表，任何时刻都有一张可用的表 */
 
@@ -1915,9 +1856,11 @@ ngx_http_ssl_cert_registry_refresh(ngx_http_ssl_cert_registry_t *reg,
 
     ngx_log_error(NGX_LOG_NOTICE, log, 0,
                   "ssl_cert_registry: \"%V\" reloaded: %ui certificates, "
-                  "%ui domains, default: %s, interval: %i, unmatched: %s",
+                  "%ui domains, default: %s, directory: %s, interval: %i, "
+                  "unmatched: %s",
                   &reg->path, t->entries.nelts, t->ndomains,
                   t->default_entry ? "yes" : "no",
+                  t->dir.len ? (char *) t->dir.data : "no",
                   (ngx_int_t) reg->interval,
                   ngx_http_ssl_cert_unmatched_name(t));
 }
@@ -1930,9 +1873,13 @@ ngx_http_ssl_cert_registry_refresh(ngx_http_ssl_cert_registry_t *reg,
  * 步骤：
  *   1. jansson 解析 JSON 文件
  *   2. 创建两个内存池：pool 给新表用，temp_pool 只在建表时用
- *   3. 逐条处理 certificates：校验字段 -> 读 PEM -> 把每个域名加进哈希 key 列表
- *   4. ngx_hash_init() 根据 key 列表生成最终的哈希表
- *   5. 销毁 temp_pool，返回新表
+ *   3. 处理顶层字段 interval / unmatched / directory
+ *   4. 逐条处理 certificates：校验字段 -> 读 PEM -> 把每个域名加进哈希 key 列表
+ *   5. ngx_hash_init() 根据 key 列表生成最终的哈希表
+ *   6. 销毁 temp_pool，返回新表
+ *
+ * "certificates" 和 "directory" 至少要有一个；只有 directory 时，哈希表是空的，
+ * 握手时只走目录模式。
  *
  * 出错时销毁两个内存池（已经读进来的 OpenSSL 对象由 cleanup 释放）并返回 NULL。
  */
@@ -1943,7 +1890,7 @@ ngx_http_ssl_cert_registry_build(ngx_http_ssl_cert_registry_t *reg,
 {
     size_t                      i, j;
     json_t                     *root, *certs, *item, *domains, *value,
-                               *enabled, *isdef;
+                               *enabled, *isdef, *empty;
     ngx_int_t                   rc;
     ngx_uint_t                  is_default;
     json_int_t                  n;
@@ -1975,17 +1922,7 @@ ngx_http_ssl_cert_registry_build(ngx_http_ssl_cert_registry_t *reg,
 
     pool = NULL;
     temp_pool = NULL;
-
-    /* json_object_get 返回的是"借用"的引用，不需要单独释放 */
-
-    certs = json_object_get(root, "certificates");
-
-    if (!json_is_array(certs)) {
-        ngx_log_error(NGX_LOG_ERR, log, 0,
-                      "ssl_cert_registry: \"%V\": \"certificates\" "
-                      "must be an array", &reg->path);
-        goto failed;
-    }
+    empty = NULL;
 
     /* 2. 创建内存池，16 KB 起步，不够时自动扩展 */
 
@@ -2031,11 +1968,11 @@ ngx_http_ssl_cert_registry_build(ngx_http_ssl_cert_registry_t *reg,
      * 顶层可选配置：
      *
      *   "interval"   检查间隔。整数表示秒，也可以写成 "5s"、"1m" 这样的
-     *                时间字符串；覆盖 ssl_cert_registry_interval。
-     *   "unmatched"  未匹配时的默认策略，default 或 reject；只在 nginx
-     *                配置里没有显式写 ssl_cert_unmatched 时生效。
+     *                时间字符串；没写就是默认的 5 秒。
+     *   "unmatched"  未匹配时的策略，default 或 reject；没写就是 default。
+     *   "directory"  证书目录，见下面的解析。
      *
-     * 两个字段都要求类型和取值合法，否则整份清单不生效。
+     * 字段类型和取值都必须合法，否则整份清单不生效。
      */
 
     value = json_object_get(root, "interval");
@@ -2114,7 +2051,45 @@ ngx_http_ssl_cert_registry_build(ngx_http_ssl_cert_registry_t *reg,
         t->unmatched_set = 1;
     }
 
-    /* 3. 逐条处理；json_array_foreach 是 jansson 提供的遍历宏，i 是下标 */
+    /* "directory"：证书目录，解析结果写进 t->dir */
+
+    if (ngx_http_ssl_cert_registry_dir(reg, root, t, pool, log) != NGX_OK) {
+        goto failed;
+    }
+
+    /*
+     * "certificates"：可选，但和 "directory" 至少要有一个。
+     * 只有 "directory" 时不建任何域名 key，握手时只走目录模式。
+     */
+
+    certs = json_object_get(root, "certificates");
+
+    if (certs == NULL) {
+
+        if (t->dir.len == 0) {
+            ngx_log_error(NGX_LOG_ERR, log, 0,
+                          "ssl_cert_registry: \"%V\": \"certificates\" or "
+                          "\"directory\" must be present", &reg->path);
+            goto failed;
+        }
+
+        /* 用一个空数组顶替，下面的遍历自然什么都不做 */
+
+        empty = json_array();
+        if (empty == NULL) {
+            goto failed;
+        }
+
+        certs = empty;
+
+    } else if (!json_is_array(certs)) {
+        ngx_log_error(NGX_LOG_ERR, log, 0,
+                      "ssl_cert_registry: \"%V\": \"certificates\" "
+                      "must be an array", &reg->path);
+        goto failed;
+    }
+
+    /* 4. 逐条处理；json_array_foreach 是 jansson 提供的遍历宏，i 是下标 */
 
     json_array_foreach(certs, i, item) {
 
@@ -2299,7 +2274,7 @@ ngx_http_ssl_cert_registry_build(ngx_http_ssl_cert_registry_t *reg,
     }
 
     /*
-     * 4. 生成哈希表
+     * 5. 生成哈希表
      *
      *   max_size     桶数量的上限；nginx 会从小往大尝试，直到所有 key 都放得下
      *   bucket_size  每个桶的字节数，必须放得下最长的 key（域名最长 253 字节），
@@ -2318,7 +2293,11 @@ ngx_http_ssl_cert_registry_build(ngx_http_ssl_cert_registry_t *reg,
         goto failed;
     }
 
-    /* 5. 临时内存和 JSON 对象都不再需要 */
+    /* 6. 临时内存和 JSON 对象都不再需要 */
+
+    if (empty) {
+        json_decref(empty);
+    }
 
     ngx_destroy_pool(temp_pool);
     json_decref(root);
@@ -2326,6 +2305,10 @@ ngx_http_ssl_cert_registry_build(ngx_http_ssl_cert_registry_t *reg,
     return t;
 
 failed:
+
+    if (empty) {
+        json_decref(empty);
+    }
 
     if (temp_pool) {
         ngx_destroy_pool(temp_pool);
@@ -2406,6 +2389,87 @@ too_long:
     ngx_log_error(NGX_LOG_ERR, log, 0,
                   "ssl_cert_registry: \"%V\": certificates[%uz].%s "
                   "is too long", &reg->path, index, field);
+
+    return NGX_ERROR;
+}
+
+
+/*
+ * 顶层 "directory"：证书目录。相对路径按清单文件所在目录解析，
+ * 结果存进 t->dir（表自己的内存池）。
+ *
+ * 字段不存在时不算错误（只说明这个 server 不启用目录模式）。
+ */
+
+static ngx_int_t
+ngx_http_ssl_cert_registry_dir(ngx_http_ssl_cert_registry_t *reg, json_t *root,
+    ngx_http_ssl_cert_table_t *t, ngx_pool_t *pool, ngx_log_t *log)
+{
+    u_char      *p;
+    size_t       len;
+    const char  *s;
+    json_t      *value;
+
+    value = json_object_get(root, "directory");
+
+    if (value == NULL) {
+        return NGX_OK;
+    }
+
+    s = json_string_value(value);
+
+    if (s == NULL || *s == '\0') {
+        ngx_log_error(NGX_LOG_ERR, log, 0,
+                      "ssl_cert_registry: \"%V\": \"directory\" must be a "
+                      "non-empty string", &reg->path);
+        return NGX_ERROR;
+    }
+
+    len = ngx_strlen(s);
+
+    if (s[0] == '/') {
+
+        /* 绝对路径 */
+
+        if (len >= NGX_MAX_PATH) {
+            goto too_long;
+        }
+
+        t->dir.data = ngx_pnalloc(pool, len + 1);
+        if (t->dir.data == NULL) {
+            return NGX_ERROR;
+        }
+
+        p = ngx_cpymem(t->dir.data, s, len);
+
+    } else {
+
+        /* 相对路径：<清单所在目录>/<相对路径> */
+
+        if (reg->dir.len + 1 + len >= NGX_MAX_PATH) {
+            goto too_long;
+        }
+
+        t->dir.data = ngx_pnalloc(pool, reg->dir.len + 1 + len + 1);
+        if (t->dir.data == NULL) {
+            return NGX_ERROR;
+        }
+
+        p = ngx_cpymem(t->dir.data, reg->dir.data, reg->dir.len);
+        *p++ = '/';
+        p = ngx_cpymem(p, s, len);
+    }
+
+    *p = '\0';
+    t->dir.len = p - t->dir.data;
+
+    return NGX_OK;
+
+too_long:
+
+    ngx_log_error(NGX_LOG_ERR, log, 0,
+                  "ssl_cert_registry: \"%V\": \"directory\" is too long",
+                  &reg->path);
 
     return NGX_ERROR;
 }

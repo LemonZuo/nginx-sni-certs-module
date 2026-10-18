@@ -1,8 +1,9 @@
 #!/bin/sh
 # 在临时 Docker 容器里编译 nginx 和 ssl_cert_dir 动态模块，验证：
-#   9443 端口：证书目录模式（ssl_cert_dir）
-#   9444 端口：证书清单模式（ssl_cert_registry，JSON），包括不 reload 的热更新和 isDefault
-#   9445 端口：证书清单模式 + ssl_cert_unmatched reject
+#   9443 端口：只有 "directory" 的清单（目录模式）
+#   9444 端口：清单模式，包括不 reload 的热更新和 isDefault
+#   9445 端口：清单里 unmatched: reject
+#   9447 端口：清单顶层 interval / unmatched
 #   nginx -t：启动检查（worker 能否读到文件、证书有效期）
 #
 # 用法：./test.sh
@@ -55,6 +56,7 @@ chmod 640 /certs/*.key /registry/certs/*.key
 #   $1 = 是否包含 d.test（yes/no）
 #   $2 = 默认证书：placeholder（只当默认的自签名证书）| a（a.test 兼做默认）| two（两条都标默认）| none
 #   $3 = 额外的顶层字段（可选），例如 '"unmatched": "default",'
+#   $4 = 写到哪个文件（可选，默认 /registry/certs.json）
 write_registry() {
     a_def=""; [ "$2" = a ] || [ "$2" = two ] && a_def=', "isDefault": true'
     {
@@ -74,8 +76,25 @@ write_registry() {
         echo '    { "domains": ["disabled.test"], "cert": "certs/disabled.crt", "key": "certs/disabled.key", "enabled": false, "isDefault": true }'
         echo '  ]'
         echo '}'
-    } > /registry/certs.json.tmp
-    mv /registry/certs.json.tmp /registry/certs.json      # 原子替换
+    } > "$4.tmp"
+    mv "$4.tmp" "$4"                                      # 原子替换
+}
+
+# 同时写两份内容一样的清单，只有 unmatched 不同：
+#   certs.json   不写 unmatched（默认 default）
+#   reject.json  unmatched: reject
+# interval 0 表示下一次握手就检查，测试里不用等
+write_both() {   # $1 = 是否包含 d.test，$2 = 默认证书
+    write_registry "$1" "$2" '"interval": 0,' /registry/certs.json
+    write_registry "$1" "$2" '"interval": 0,
+  "unmatched": "reject",' /registry/reject.json
+}
+
+# 只有 directory、没有 certificates 的清单
+write_dir_registry() {
+    printf '{\n  "interval": 0,\n  "directory": "%s"\n}\n' "$1" \
+        > /registry/dir.json.tmp
+    mv /registry/dir.json.tmp /registry/dir.json
 }
 
 # 独立清单：测试 JSON 顶层的 interval / unmatched
@@ -98,8 +117,9 @@ write_policy_registry() {
     mv /registry/policy.json.tmp /registry/policy.json    # 原子替换
 }
 
-write_registry no placeholder
-# interval 0：每次握手都检查，方便测试；unmatched 由清单决定（server 里没写指令）
+write_both no placeholder
+write_dir_registry /certs
+# interval 0：每次握手都检查，方便测试
 write_policy_registry '"interval": 0,' '"unmatched": "reject",' no
 
 cat > /tmp/ng/conf/nginx.conf <<'EOF'
@@ -110,14 +130,12 @@ error_log logs/error.log info;      # info：能看到"匹配不上"的日志
 events {}
 
 http {
-    ssl_cert_registry_interval 1s;
-
-    # 证书目录模式
+    # 目录模式：清单里只有 "directory"，没有 "certificates"
     server {
         listen 9443 ssl;
         ssl_certificate     /certs/default.crt;
         ssl_certificate_key /certs/default.key;
-        ssl_cert_dir        /certs;
+        ssl_cert_registry   /registry/dir.json;
         return 200 "ok\n";
     }
 
@@ -130,17 +148,16 @@ http {
         return 200 "ok\n";
     }
 
-    # 证书清单模式，匹配不上时拒绝握手
+    # 清单里 unmatched: reject，匹配不上时拒绝握手
     server {
         listen 9445 ssl;
         ssl_certificate     /certs/default.crt;
         ssl_certificate_key /certs/default.key;
-        ssl_cert_registry   /registry/certs.json;
-        ssl_cert_unmatched  reject;
+        ssl_cert_registry   /registry/reject.json;
         return 200 "ok\n";
     }
 
-    # 清单顶层 interval / unmatched（server 里不写 ssl_cert_unmatched）
+    # 清单顶层 interval / unmatched
     server {
         listen 9447 ssl;
         ssl_certificate     /certs/default.crt;
@@ -252,18 +269,40 @@ check 9447 unknown.test   握手失败
 assert '清单：interval 支持时间字符串' \
     grep -q '"/registry/policy.json" reloaded:.*interval: 2, unmatched: reject' $LOG
 
-# 清单里删掉 interval：应回落到 ssl_cert_registry_interval（这里是 1s），
-# 而不是继续沿用上一份清单的 2
+# 清单里删掉 interval：应回落到内置默认值 5，而不是继续沿用上一份清单的 2
 write_policy_registry '' '"unmatched": "reject",' yes
 sleep 2                                            # 上一份清单的间隔是 2s
 check 9447 a.test         CN=a.test
-assert '清单：删除 interval 后回落到指令值' \
-    sh -c "grep 'policy.json\" reloaded' $LOG | tail -1 | grep -q 'interval: 1,'"
+assert '清单：删除 interval 后回落到默认值' \
+    sh -c "grep 'policy.json\" reloaded' $LOG | tail -1 | grep -q 'interval: 5,'"
 
 echo "== 热更新：往清单里加入 d.test（不 reload nginx）"
-write_registry yes placeholder
+write_both yes placeholder
 sleep 2
 check 9444 d.test         CN=d.test
+
+echo "== 顶层 directory：只有 directory 的清单 / 非法值"
+write_dir_registry /nonexistent                 # 目录不存在：清单仍然加载成功
+check 9443 unknown.test   CN=default.invalid
+assert '只有 directory 的清单能加载' \
+    grep -q '"/registry/dir.json" reloaded:.*directory: /nonexistent' $LOG
+
+write_dir_registry /certs                       # 换回真实目录
+check 9443 a.test         CN=a.test
+
+printf '{ "directory": "", "certificates": [] }' > /registry/dir.json.tmp
+mv /registry/dir.json.tmp /registry/dir.json
+check 9443 a.test         CN=a.test             # 非法值：整份清单不生效，继续用旧的
+assert 'directory 不能是空字符串' \
+    grep -q '"directory" must be a non-empty string' $LOG
+
+printf '{ "interval": 0 }' > /registry/dir.json.tmp
+mv /registry/dir.json.tmp /registry/dir.json
+check 9443 a.test         CN=a.test
+assert 'certificates 和 directory 至少要有一个' \
+    grep -q '"certificates" or "directory" must be present' $LOG
+
+write_dir_registry /certs                       # 恢复，后面的用例还要用
 
 echo "== 清单写坏了：继续使用旧的证书表"
 printf '{ "certificates": [ broken' > /registry/certs.json.tmp
@@ -278,13 +317,13 @@ echo "== 证书续期：替换 a.test 的证书文件，再重写清单触发重
 ec /certs a.test /CN=a.test/O=renewed
 chown root:nobody /certs/a.test.key && chmod 640 /certs/a.test.key
 check 9443 a.test         CN=a.test,O=renewed    # 目录模式每次握手读文件，立即生效
-write_registry yes placeholder
+write_both yes placeholder
 sleep 2
 check 9444 a.test         CN=a.test,O=renewed
 check 9444 d.test         CN=d.test
 
 echo "== 默认证书热切换：改成 a.test 兼做默认证书"
-write_registry yes a
+write_both yes a
 sleep 2
 check 9444 unknown.test   CN=a.test,O=renewed
 check 9444 "(无SNI)"      CN=a.test,O=renewed
@@ -292,24 +331,24 @@ check 9444 a.test         CN=a.test,O=renewed    # 自己的域名照常匹配
 check 9445 unknown.test   握手失败               # reject 时不使用 isDefault 证书
 
 echo "== 两条都标了 isDefault：整份清单不生效，继续使用旧的"
-write_registry yes two
+write_both yes two
 sleep 2
 check 9444 unknown.test   CN=a.test,O=renewed
 assert "error.log 记录了重复的 isDefault" grep -q 'more than one certificate has "isDefault": true' /tmp/ng/logs/error.log
 
 echo "== 清单里没有默认证书：回退到 ssl_certificate"
-write_registry yes none
+write_both yes none
 sleep 2
 check 9444 unknown.test   CN=default.invalid
 check 9444 "(无SNI)"      CN=default.invalid
 check 9444 a.test         CN=a.test,O=renewed
 
-echo "== ssl_cert_unmatched 指令优先于清单里的 unmatched"
-# 9445 显式写了 ssl_cert_unmatched reject；清单里写 default 也不应改变它
-write_registry yes none '"unmatched": "default",'
+echo "== 策略写在清单里：不同清单互不影响"
+# certs.json 没写 unmatched（默认 default），reject.json 写了 reject
+write_both yes none
 sleep 2
-check 9445 unknown.test   握手失败               # 指令 reject 优先
-check 9444 unknown.test   CN=default.invalid     # 9444 没写指令，用清单里的 default
+check 9444 unknown.test   CN=default.invalid     # 清单没写 unmatched，用默认证书
+check 9445 unknown.test   握手失败               # 清单写了 reject
 
 echo "== 启动检查：用一份单独的配置跑 nginx -t"
 # worker 以 nobody 运行；这些文件有的它读不到，有的快到期了
@@ -331,8 +370,10 @@ chown root:root /check/private.key /check/dir/dpriv.test.key
 chmod 600 /check/private.key /check/dir/dpriv.test.key
 chmod 700 /check/hidden
 
+# 清单里的 "directory": "dir" 相对清单文件所在目录（/check）解析
 cat > /check/certs.json <<'EOF'
 {
+  "directory": "dir",
   "certificates": [
     { "domains": ["soon.test"],    "cert": "soon.crt",      "key": "soon.key" },
     { "domains": ["private.test"], "cert": "private.crt",   "key": "private.key" },
@@ -354,7 +395,6 @@ http {
         ssl_certificate     /certs/default.crt;
         ssl_certificate_key /certs/default.key;
         ssl_cert_registry   /check/certs.json;
-        ssl_cert_dir        /check/dir;
     }
 }
 EOF
