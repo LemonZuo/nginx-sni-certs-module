@@ -125,9 +125,9 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 
-/* jansson：解析 JSON 证书清单（链接参数 -ljansson 写在 config 文件里） */
+/* 内置的极简 JSON 解析器：解析证书清单，不依赖外部库 */
 
-#include <jansson.h>
+#include "ngx_http_ssl_cert_json.h"
 
 
 /*
@@ -310,10 +310,10 @@ static void ngx_http_ssl_cert_registry_refresh(
 static ngx_http_ssl_cert_table_t *ngx_http_ssl_cert_registry_build(
     ngx_http_ssl_cert_registry_t *reg, ngx_log_t *log);
 static ngx_int_t ngx_http_ssl_cert_registry_path(
-    ngx_http_ssl_cert_registry_t *reg, json_t *value, u_char *buf,
-    ngx_log_t *log, size_t index, char *field);
+    ngx_http_ssl_cert_registry_t *reg, ngx_http_ssl_cert_json_t *value,
+    u_char *buf, ngx_log_t *log, size_t index, char *field);
 static ngx_int_t ngx_http_ssl_cert_registry_dir(
-    ngx_http_ssl_cert_registry_t *reg, json_t *root,
+    ngx_http_ssl_cert_registry_t *reg, ngx_http_ssl_cert_json_t *root,
     ngx_http_ssl_cert_table_t *t, ngx_pool_t *pool, ngx_log_t *log);
 static ngx_http_ssl_cert_entry_t *ngx_http_ssl_cert_registry_find(
     ngx_http_ssl_cert_table_t *t, u_char *name);
@@ -1889,16 +1889,14 @@ ngx_http_ssl_cert_registry_build(ngx_http_ssl_cert_registry_t *reg,
     ngx_log_t *log)
 {
     size_t                      i, j;
-    json_t                     *root, *certs, *item, *domains, *value,
-                               *enabled, *isdef, *empty;
     ngx_int_t                   rc;
-    ngx_uint_t                  is_default;
-    json_int_t                  n;
+    ngx_uint_t                  is_default, enabled_on, isdef_on;
+    int64_t                     n;
     ngx_int_t                   tt;
-    ngx_str_t                   name, tv;
-    const char                 *s;
-    json_error_t                jerr;
+    ngx_str_t                   name, tv, *sv;
     ngx_pool_t                 *pool, *temp_pool;
+    ngx_http_ssl_cert_json_t   *root, *certs, *item, *domains, *value,
+                               *enabled, *isdef;
     ngx_hash_init_t             hinit;
     ngx_pool_cleanup_t         *cln;
     ngx_hash_keys_arrays_t      ha;
@@ -1907,24 +1905,12 @@ ngx_http_ssl_cert_registry_build(ngx_http_ssl_cert_registry_t *reg,
     u_char                      crt[NGX_MAX_PATH], key[NGX_MAX_PATH];
     u_char                      norm[NGX_HTTP_SSL_CERT_MAX_NAME + 1];
 
-    /* 1. 解析 JSON；格式错误时 jerr 里有行号和原因 */
-
-    root = json_load_file((char *) reg->path.data, 0, &jerr);
-
-    if (root == NULL) {
-        ngx_log_error(NGX_LOG_ERR, log, 0,
-                      "ssl_cert_registry: \"%V\", line %d: %s",
-                      &reg->path, jerr.line, jerr.text);
-        return NULL;
-    }
-
     /* 先置空，出错跳到 failed 时才知道哪些需要释放 */
 
     pool = NULL;
     temp_pool = NULL;
-    empty = NULL;
 
-    /* 2. 创建内存池，16 KB 起步，不够时自动扩展 */
+    /* 1. 创建内存池，16 KB 起步，不够时自动扩展 */
 
     pool = ngx_create_pool(16384, reg->log);
     if (pool == NULL) {
@@ -1933,6 +1919,20 @@ ngx_http_ssl_cert_registry_build(ngx_http_ssl_cert_registry_t *reg,
 
     temp_pool = ngx_create_pool(16384, reg->log);
     if (temp_pool == NULL) {
+        goto failed;
+    }
+
+    /*
+     * 2. 解析 JSON，节点全部分配在 temp_pool 里。
+     *
+     * 建表只用到清单里的字符串，用完就不再需要这棵树，所以让它跟着
+     * temp_pool 一起销毁，不占着证书表的内存。解析失败时错误已经写进
+     * 日志（带行号），这里直接返回。
+     */
+
+    root = ngx_http_ssl_cert_json_load(temp_pool, reg->path.data, log);
+
+    if (root == NULL) {
         goto failed;
     }
 
@@ -1975,36 +1975,37 @@ ngx_http_ssl_cert_registry_build(ngx_http_ssl_cert_registry_t *reg,
      * 字段类型和取值都必须合法，否则整份清单不生效。
      */
 
-    value = json_object_get(root, "interval");
+    value = ngx_http_ssl_cert_json_get(root, "interval");
 
     if (value != NULL) {
 
-        if (json_is_integer(value)) {
+        if (ngx_http_ssl_cert_json_is(value, NGX_HTTP_SSL_CERT_JSON_INT)) {
 
-            n = json_integer_value(value);
+            if (ngx_http_ssl_cert_json_int(value, &n) != NGX_OK) {
+                goto failed;
+            }
 
-            if (n < 0 || (json_int_t) (time_t) n != n) {
+            if ((int64_t) (time_t) n != n) {
                 ngx_log_error(NGX_LOG_ERR, log, 0,
                               "ssl_cert_registry: \"%V\": \"interval\" "
-                              "must be a non-negative number of seconds",
-                              &reg->path);
+                              "is too large", &reg->path);
                 goto failed;
             }
 
             t->interval = (time_t) n;
 
-        } else if (json_is_string(value)) {
+        } else if (ngx_http_ssl_cert_json_is(value,
+                                             NGX_HTTP_SSL_CERT_JSON_STRING))
+        {
+            sv = ngx_http_ssl_cert_json_string(value);
 
-            s = json_string_value(value);
-
-            tv.len = ngx_strlen(s);
-            tv.data = (u_char *) s;
+            tv = *sv;
             tt = ngx_parse_time(&tv, 1);
 
             if (tt == NGX_ERROR) {
                 ngx_log_error(NGX_LOG_ERR, log, 0,
                               "ssl_cert_registry: \"%V\": invalid "
-                              "\"interval\" \"%s\"", &reg->path, s);
+                              "\"interval\" \"%V\"", &reg->path, sv);
                 goto failed;
             }
 
@@ -2021,30 +2022,32 @@ ngx_http_ssl_cert_registry_build(ngx_http_ssl_cert_registry_t *reg,
         t->interval_set = 1;
     }
 
-    value = json_object_get(root, "unmatched");
+    value = ngx_http_ssl_cert_json_get(root, "unmatched");
 
     if (value != NULL) {
 
-        s = json_string_value(value);
+        sv = ngx_http_ssl_cert_json_string(value);
 
-        if (s == NULL) {
+        if (sv == NULL) {
             ngx_log_error(NGX_LOG_ERR, log, 0,
                           "ssl_cert_registry: \"%V\": \"unmatched\" must be "
                           "\"default\" or \"reject\"", &reg->path);
             goto failed;
         }
 
-        if (ngx_strcmp(s, "default") == 0) {
+        /* 字符串已经以 '\0' 结尾，可以直接比较 */
+
+        if (ngx_strcmp(sv->data, "default") == 0) {
             t->unmatched = NGX_HTTP_SSL_CERT_UNMATCHED_DEFAULT;
 
-        } else if (ngx_strcmp(s, "reject") == 0) {
+        } else if (ngx_strcmp(sv->data, "reject") == 0) {
             t->unmatched = NGX_HTTP_SSL_CERT_UNMATCHED_REJECT;
 
         } else {
             ngx_log_error(NGX_LOG_ERR, log, 0,
                           "ssl_cert_registry: \"%V\": \"unmatched\" must be "
-                          "\"default\" or \"reject\", got \"%s\"",
-                          &reg->path, s);
+                          "\"default\" or \"reject\", got \"%V\"",
+                          &reg->path, sv);
             goto failed;
         }
 
@@ -2062,7 +2065,7 @@ ngx_http_ssl_cert_registry_build(ngx_http_ssl_cert_registry_t *reg,
      * 只有 "directory" 时不建任何域名 key，握手时只走目录模式。
      */
 
-    certs = json_object_get(root, "certificates");
+    certs = ngx_http_ssl_cert_json_get(root, "certificates");
 
     if (certs == NULL) {
 
@@ -2075,25 +2078,29 @@ ngx_http_ssl_cert_registry_build(ngx_http_ssl_cert_registry_t *reg,
 
         /* 用一个空数组顶替，下面的遍历自然什么都不做 */
 
-        empty = json_array();
-        if (empty == NULL) {
+        certs = ngx_http_ssl_cert_json_array(temp_pool);
+        if (certs == NULL) {
             goto failed;
         }
 
-        certs = empty;
-
-    } else if (!json_is_array(certs)) {
+    } else if (!ngx_http_ssl_cert_json_is(certs,
+                                          NGX_HTTP_SSL_CERT_JSON_ARRAY))
+    {
         ngx_log_error(NGX_LOG_ERR, log, 0,
                       "ssl_cert_registry: \"%V\": \"certificates\" "
                       "must be an array", &reg->path);
         goto failed;
     }
 
-    /* 4. 逐条处理；json_array_foreach 是 jansson 提供的遍历宏，i 是下标 */
+    /* 4. 逐条处理；i 是数组下标 */
 
-    json_array_foreach(certs, i, item) {
+    for (i = 0; i < ngx_http_ssl_cert_json_size(certs); i++) {
 
-        if (!json_is_object(item)) {
+        item = ngx_http_ssl_cert_json_at(certs, i);
+
+        if (!ngx_http_ssl_cert_json_is(item,
+                                       NGX_HTTP_SSL_CERT_JSON_OBJECT))
+        {
             ngx_log_error(NGX_LOG_ERR, log, 0,
                           "ssl_cert_registry: \"%V\": certificates[%uz] "
                           "must be an object", &reg->path, i);
@@ -2102,31 +2109,41 @@ ngx_http_ssl_cert_registry_build(ngx_http_ssl_cert_registry_t *reg,
 
         /* enabled：可选，必须是布尔值；false 时整条跳过 */
 
-        enabled = json_object_get(item, "enabled");
+        enabled = ngx_http_ssl_cert_json_get(item, "enabled");
 
-        if (enabled != NULL && !json_is_boolean(enabled)) {
-            ngx_log_error(NGX_LOG_ERR, log, 0,
-                          "ssl_cert_registry: \"%V\": certificates[%uz]"
-                          ".enabled must be true or false", &reg->path, i);
-            goto failed;
-        }
+        if (enabled != NULL) {
 
-        if (enabled != NULL && json_is_false(enabled)) {
-            continue;
+            if (ngx_http_ssl_cert_json_bool(enabled, &enabled_on)
+                != NGX_OK)
+            {
+                ngx_log_error(NGX_LOG_ERR, log, 0,
+                              "ssl_cert_registry: \"%V\": certificates[%uz]"
+                              ".enabled must be true or false", &reg->path, i);
+                goto failed;
+            }
+
+            if (enabled_on == 0) {
+                continue;
+            }
         }
 
         /* isDefault：可选，必须是布尔值；最多一条为 true */
 
-        isdef = json_object_get(item, "isDefault");
+        isdef = ngx_http_ssl_cert_json_get(item, "isDefault");
+        is_default = 0;
 
-        if (isdef != NULL && !json_is_boolean(isdef)) {
-            ngx_log_error(NGX_LOG_ERR, log, 0,
-                          "ssl_cert_registry: \"%V\": certificates[%uz]"
-                          ".isDefault must be true or false", &reg->path, i);
-            goto failed;
+        if (isdef != NULL) {
+
+            if (ngx_http_ssl_cert_json_bool(isdef, &isdef_on) != NGX_OK) {
+                ngx_log_error(NGX_LOG_ERR, log, 0,
+                              "ssl_cert_registry: \"%V\": certificates[%uz]"
+                              ".isDefault must be true or false",
+                              &reg->path, i);
+                goto failed;
+            }
+
+            is_default = isdef_on;
         }
-
-        is_default = (isdef != NULL && json_is_true(isdef));
 
         if (is_default && t->default_entry != NULL) {
             ngx_log_error(NGX_LOG_ERR, log, 0,
@@ -2138,29 +2155,31 @@ ngx_http_ssl_cert_registry_build(ngx_http_ssl_cert_registry_t *reg,
 
         /* cert / key：必填，转换成完整路径写进 crt / key 缓冲区 */
 
-        if (ngx_http_ssl_cert_registry_path(reg, json_object_get(item, "cert"),
-                                            crt, log, i, "cert")
-            != NGX_OK)
+        if (ngx_http_ssl_cert_registry_path(
+                reg, ngx_http_ssl_cert_json_get(item, "cert"),
+                crt, log, i, "cert") != NGX_OK)
         {
             goto failed;
         }
 
-        if (ngx_http_ssl_cert_registry_path(reg, json_object_get(item, "key"),
-                                            key, log, i, "key")
-            != NGX_OK)
+        if (ngx_http_ssl_cert_registry_path(
+                reg, ngx_http_ssl_cert_json_get(item, "key"),
+                key, log, i, "key") != NGX_OK)
         {
             goto failed;
         }
 
         /* 只当默认证书用的条目可以不写 domains */
 
-        domains = json_object_get(item, "domains");
+        domains = ngx_http_ssl_cert_json_get(item, "domains");
 
         if (domains == NULL && is_default) {
             /* 没有域名，只作为默认证书 */
 
-        } else if (!json_is_array(domains)
-                   || (json_array_size(domains) == 0 && !is_default))
+        } else if (!ngx_http_ssl_cert_json_is(domains,
+                                              NGX_HTTP_SSL_CERT_JSON_ARRAY)
+                   || (ngx_http_ssl_cert_json_size(domains) == 0
+                       && !is_default))
         {
             ngx_log_error(NGX_LOG_ERR, log, 0,
                           "ssl_cert_registry: \"%V\": certificates[%uz]"
@@ -2216,15 +2235,16 @@ ngx_http_ssl_cert_registry_build(ngx_http_ssl_cert_registry_t *reg,
 
         /* 每个域名都作为一个 key 指向这张证书（domains 为 NULL 时不进循环） */
 
-        json_array_foreach(domains, j, value) {
+        for (j = 0; j < ngx_http_ssl_cert_json_size(domains); j++) {
 
-            s = json_string_value(value);
+            value = ngx_http_ssl_cert_json_at(domains, j);
+            sv = ngx_http_ssl_cert_json_string(value);
 
             /* 不是字符串，或者不是合法域名（允许 "*." 开头的通配符） */
 
-            if (s == NULL
-                || ngx_http_ssl_cert_normalize(s, norm, sizeof(norm), 1)
-                   != NGX_OK)
+            if (sv == NULL
+                || ngx_http_ssl_cert_normalize((char *) sv->data, norm,
+                                               sizeof(norm), 1) != NGX_OK)
             {
                 ngx_log_error(NGX_LOG_ERR, log, 0,
                               "ssl_cert_registry: \"%V\": certificates[%uz]"
@@ -2293,22 +2313,13 @@ ngx_http_ssl_cert_registry_build(ngx_http_ssl_cert_registry_t *reg,
         goto failed;
     }
 
-    /* 6. 临时内存和 JSON 对象都不再需要 */
-
-    if (empty) {
-        json_decref(empty);
-    }
+    /* 6. 临时内存（含整棵 JSON 树）不再需要 */
 
     ngx_destroy_pool(temp_pool);
-    json_decref(root);
 
     return t;
 
 failed:
-
-    if (empty) {
-        json_decref(empty);
-    }
 
     if (temp_pool) {
         ngx_destroy_pool(temp_pool);
@@ -2319,10 +2330,6 @@ failed:
     if (pool) {
         ngx_destroy_pool(pool);
     }
-
-    /* jansson 用引用计数管理内存，释放根对象即释放整棵树 */
-
-    json_decref(root);
 
     return NULL;
 }
@@ -2338,46 +2345,44 @@ failed:
 
 static ngx_int_t
 ngx_http_ssl_cert_registry_path(ngx_http_ssl_cert_registry_t *reg,
-    json_t *value, u_char *buf, ngx_log_t *log, size_t index, char *field)
+    ngx_http_ssl_cert_json_t *value, u_char *buf, ngx_log_t *log,
+    size_t index, char *field)
 {
-    u_char      *p;
-    size_t       len;
-    const char  *s;
+    u_char     *p;
+    ngx_str_t  *s;
 
-    /* 字段不存在或者不是字符串时，json_string_value 返回 NULL */
+    /* 字段不存在或者不是字符串时，返回 NULL */
 
-    s = json_string_value(value);
+    s = ngx_http_ssl_cert_json_string(value);
 
-    if (s == NULL || *s == '\0') {
+    if (s == NULL || s->len == 0) {
         ngx_log_error(NGX_LOG_ERR, log, 0,
                       "ssl_cert_registry: \"%V\": certificates[%uz].%s "
                       "must be a non-empty string", &reg->path, index, field);
         return NGX_ERROR;
     }
 
-    len = ngx_strlen(s);
-
-    if (s[0] == '/') {
+    if (s->data[0] == '/') {
 
         /* 绝对路径：原样复制 */
 
-        if (len >= NGX_MAX_PATH) {
+        if (s->len >= NGX_MAX_PATH) {
             goto too_long;
         }
 
-        p = ngx_cpymem(buf, s, len);
+        p = ngx_cpymem(buf, s->data, s->len);
 
     } else {
 
         /* 相对路径：拼成 "<清单所在目录>/<相对路径>" */
 
-        if (reg->dir.len + 1 + len >= NGX_MAX_PATH) {
+        if (reg->dir.len + 1 + s->len >= NGX_MAX_PATH) {
             goto too_long;
         }
 
         p = ngx_cpymem(buf, reg->dir.data, reg->dir.len);
         *p++ = '/';
-        p = ngx_cpymem(p, s, len);
+        p = ngx_cpymem(p, s->data, s->len);
     }
 
     *p = '\0';
@@ -2402,62 +2407,60 @@ too_long:
  */
 
 static ngx_int_t
-ngx_http_ssl_cert_registry_dir(ngx_http_ssl_cert_registry_t *reg, json_t *root,
-    ngx_http_ssl_cert_table_t *t, ngx_pool_t *pool, ngx_log_t *log)
+ngx_http_ssl_cert_registry_dir(ngx_http_ssl_cert_registry_t *reg,
+    ngx_http_ssl_cert_json_t *root, ngx_http_ssl_cert_table_t *t,
+    ngx_pool_t *pool, ngx_log_t *log)
 {
-    u_char      *p;
-    size_t       len;
-    const char  *s;
-    json_t      *value;
+    u_char                    *p;
+    ngx_str_t                 *s;
+    ngx_http_ssl_cert_json_t  *value;
 
-    value = json_object_get(root, "directory");
+    value = ngx_http_ssl_cert_json_get(root, "directory");
 
     if (value == NULL) {
         return NGX_OK;
     }
 
-    s = json_string_value(value);
+    s = ngx_http_ssl_cert_json_string(value);
 
-    if (s == NULL || *s == '\0') {
+    if (s == NULL || s->len == 0) {
         ngx_log_error(NGX_LOG_ERR, log, 0,
                       "ssl_cert_registry: \"%V\": \"directory\" must be a "
                       "non-empty string", &reg->path);
         return NGX_ERROR;
     }
 
-    len = ngx_strlen(s);
-
-    if (s[0] == '/') {
+    if (s->data[0] == '/') {
 
         /* 绝对路径 */
 
-        if (len >= NGX_MAX_PATH) {
+        if (s->len >= NGX_MAX_PATH) {
             goto too_long;
         }
 
-        t->dir.data = ngx_pnalloc(pool, len + 1);
+        t->dir.data = ngx_pnalloc(pool, s->len + 1);
         if (t->dir.data == NULL) {
             return NGX_ERROR;
         }
 
-        p = ngx_cpymem(t->dir.data, s, len);
+        p = ngx_cpymem(t->dir.data, s->data, s->len);
 
     } else {
 
         /* 相对路径：<清单所在目录>/<相对路径> */
 
-        if (reg->dir.len + 1 + len >= NGX_MAX_PATH) {
+        if (reg->dir.len + 1 + s->len >= NGX_MAX_PATH) {
             goto too_long;
         }
 
-        t->dir.data = ngx_pnalloc(pool, reg->dir.len + 1 + len + 1);
+        t->dir.data = ngx_pnalloc(pool, reg->dir.len + 1 + s->len + 1);
         if (t->dir.data == NULL) {
             return NGX_ERROR;
         }
 
         p = ngx_cpymem(t->dir.data, reg->dir.data, reg->dir.len);
         *p++ = '/';
-        p = ngx_cpymem(p, s, len);
+        p = ngx_cpymem(p, s->data, s->len);
     }
 
     *p = '\0';

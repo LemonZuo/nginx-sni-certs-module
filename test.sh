@@ -15,9 +15,9 @@ NGINX_VERSION=${NGINX_VERSION:-1.30.5}
 
 docker run --rm -i -e NGINX_VERSION="$NGINX_VERSION" -v "$PWD":/work:ro alpine:3 sh -s <<'SCRIPT'
 set -eu
-apk add --no-cache build-base pcre2-dev zlib-dev openssl-dev openssl jansson-dev >/dev/null
+apk add --no-cache build-base pcre2-dev zlib-dev openssl-dev openssl >/dev/null
 
-echo "== 编译 nginx $NGINX_VERSION（带 ssl_cert_dir 动态模块）"
+echo "== 编译 nginx $NGINX_VERSION（带 ssl_cert_dir 动态模块，无外部依赖）"
 cd /tmp
 wget -q "https://nginx.org/download/nginx-$NGINX_VERSION.tar.gz"
 tar xf "nginx-$NGINX_VERSION.tar.gz"
@@ -275,6 +275,42 @@ sleep 2                                            # 上一份清单的间隔是
 check 9447 a.test         CN=a.test
 assert '清单：删除 interval 后回落到默认值' \
     sh -c "grep 'policy.json\" reloaded' $LOG | tail -1 | grep -q 'interval: 5,'"
+
+echo "== 清单解析：不合法的写法都会被拒绝"
+# 先让检查间隔变成 0，后面写坏清单时下一次握手就能发现。
+# 上一份清单没写 interval，回落到默认的 5 秒，所以要等够一个周期
+write_policy_registry '"interval": 0,' '"unmatched": "default",' yes
+sleep 6
+check 9447 a.test         CN=a.test
+assert '解析：间隔已切换为 0' \
+    sh -c "grep 'policy.json\" reloaded' $LOG | tail -1 | grep -q 'interval: 0,'"
+
+# 写一份原始清单（不经过生成函数），验证解析器的报错；旧证书表必须继续生效
+raw_error() {   # $1 = 描述，$2 = 清单内容，$3 = 期望的错误信息片段
+    printf '%s' "$2" > /registry/policy.json.tmp
+    mv /registry/policy.json.tmp /registry/policy.json
+    check 9447 a.test     CN=a.test
+    assert "$1" grep -q "$3" $LOG
+}
+
+raw_error '解析：顶层不是对象'      '[1]'                    'the top-level value must be an object'
+raw_error '解析：末尾有多余内容'    '{ "certificates": [] } x' 'trailing data after the top-level value'
+raw_error '解析：空文件'            ''                       'is empty'
+raw_error '解析：不支持 null'       '{ "certificates": null }' '"null" is not supported'
+raw_error '解析：不支持负数'        '{ "interval": -1 }'     'negative numbers are not supported'
+raw_error '解析：不支持小数'        '{ "interval": 1.5 }'    'fractions and exponents are not supported'
+raw_error '解析：不支持前导零'      '{ "interval": 01 }'     'leading zeros are not allowed'
+raw_error '解析：数字太大'          '{ "interval": 99999999999999999999 }' 'the number is too large'
+raw_error '解析：不支持 \u 转义'    '{ "a": "\u0041" }'     'is not supported, write the character'
+raw_error '解析：未知转义'          '{ "a": "\q" }'          'unknown escape'
+raw_error '解析：字符串没有结束'    '{ "a": "x }'            'the string is not terminated'
+raw_error '解析：成员名重复'        '{ "a": 1, "a": 2 }'     'duplicate member "a"'
+raw_error '解析：成员名后缺冒号'    '{ "a" 1 }'              "expecting ':' after the member name"
+raw_error '解析：值之间缺逗号'      '{ "a": 1 "b": 2 }'      "expecting ',' or '}'"
+raw_error '解析：对象没有结束'      '{ "a": 1'               'the object is not terminated'
+raw_error '解析：数组没有结束'      '{ "a": [1'              'the array is not terminated'
+raw_error '解析：嵌套太深'          '[[[[[[[[[[1]]]]]]]]]]'   'too many nested levels'
+raw_error '解析：字符串里有控制字符' "$(printf '{"a": "x\ny"}')" 'control character in the string'
 
 echo "== 热更新：往清单里加入 d.test（不 reload nginx）"
 write_both yes placeholder
