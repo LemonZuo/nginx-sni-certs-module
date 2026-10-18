@@ -77,8 +77,11 @@ EOF
 # interval: 0：每次握手都检查清单文件（stat），用来衡量这项开销
 sed '1a\  "interval": 0,' /registry/bench.json > /registry/bench0.json
 
-# 目录模式：清单里只有 directory
+# 目录模式：清单里只有 directory（证书缓存默认 1024 条）
 echo '{ "directory": "/certs" }' > /registry/dir.json
+
+# 目录模式，关掉缓存（cache: 0）：每次握手都读盘并解析
+echo '{ "directory": "/certs", "cache": 0 }' > /registry/dir0.json
 
 # 大清单：BIG 条无关域名 + a.test，用来验证哈希查找不会随条目数变慢
 {
@@ -147,6 +150,15 @@ http {
         ssl_certificate     /certs/default.crt;
         ssl_certificate_key /certs/default.key;
         ssl_cert_registry   /registry/bench0.json;
+        return 200 "ok\n";
+    }
+
+    # 目录模式 + cache: 0：每次握手读盘并解析证书
+    server {
+        listen 9445 ssl;
+        ssl_certificate     /certs/default.crt;
+        ssl_certificate_key /certs/default.key;
+        ssl_cert_registry   /registry/dir0.json;
         return 200 "ok\n";
     }
 
@@ -234,7 +246,8 @@ registry-big a.test 9444
 registry-int0 a.test 9443
 dir-hit a.test 9442
 dir-wildcard x.c.test 9442
-dir-miss unknown.test 9442'
+dir-miss unknown.test 9442
+dir-nocache a.test 9445'
 
 : >/tmp/results
 

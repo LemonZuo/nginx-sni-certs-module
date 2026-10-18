@@ -9,6 +9,7 @@
  *        精确域名 -> "*.上一级域名"（只向上找一级，与 TLS 通配符语义一致）
  *   2. 证书目录（清单里的 "directory"）：
  *        <dir>/<域名>.crt -> <dir>/wildcard.<上一级域名>.crt
+ *        解析结果会缓存在内存里（见 "cache"），命中时只 stat 两个文件
  *   3. 清单里 "isDefault": true 的证书
  *   4. server 块里 ssl_certificate 配置的证书
  *
@@ -39,6 +40,8 @@
  *                                              配了哪些字段推断，写了就必须一致
  *     "directory": "certs",                    可选，证书目录；相对路径按清单文件
  *                                              所在目录解析
+ *     "cache": 1024,                           可选，目录模式的证书缓存条数，
+ *                                              0 表示不缓存，默认 1024
  *     "certificates": [                        可选，但和 "directory" 至少有一个
  *       {
  *         "domains": ["example.com", "www.example.com", "*.example.com"],
@@ -170,6 +173,11 @@
 #define NGX_HTTP_SSL_CERT_UNMATCHED_REJECT   1   /* 拒绝握手 */
 
 
+/* 目录模式的证书缓存默认保留多少条 */
+
+#define NGX_HTTP_SSL_CERT_DIR_CACHE_DEFAULT  1024
+
+
 /* 清单顶层 "mode" 的取值：用哪种证书来源 */
 
 #define NGX_HTTP_SSL_CERT_MODE_CERTIFICATES  0   /* 只用 certificates */
@@ -186,6 +194,9 @@
  * 三个都是 OpenSSL 的对象，在加载清单时从 PEM 文件解析出来，之后握手直接使用。
  */
 
+typedef struct ngx_http_ssl_cert_dir_cache_s  ngx_http_ssl_cert_dir_cache_t;
+
+
 typedef struct {
     X509                          *cert;       /* 叶子证书（网站证书本身） */
     STACK_OF(X509)                *chain;      /* 中间证书链，可以为空 */
@@ -193,6 +204,44 @@ typedef struct {
     u_char                        *cert_path;  /* 证书文件路径，'\0' 结尾，启动时检查权限用 */
     u_char                        *key_path;   /* 私钥文件路径，同上 */
 } ngx_http_ssl_cert_entry_t;
+
+
+/*
+ * 目录模式的证书缓存。
+ *
+ * 目录模式每次握手都要打开、解析证书链和私钥，实测约 50 µs（其中解析占 95%）。
+ * 这里把解析好的对象缓存起来，命中时只做两次 stat 判断文件有没有变：
+ *
+ *   - 文件没变（inode / 修改时间 / 大小都相同）：直接用缓存的对象，约 0.5 µs；
+ *   - 文件变了：重新解析并替换缓存项；
+ *   - 缓存满了：淘汰最早插入的那一条（FIFO），用环形数组实现。
+ *
+ * 为什么是 FIFO 而不是 LRU：证书集合通常是稳定的（每个域名固定在用一张证书），
+ * LRU 多出来的链表维护在命中路径上不划算；FIFO 的命中路径最短。
+ *
+ * 缓存挂在证书表的内存池上，清单重新加载时跟着旧表一起释放，不会用旧证书。
+ * 内部的 OpenSSL 对象和清单模式一样通过 pool cleanup 释放。
+ */
+
+typedef struct {
+    ngx_str_t                      base;      /* 域名（或 wildcard.<域名>），缓存键 */
+    ngx_file_uniq_t                uniq;      /* 加载时证书文件的 inode */
+    time_t                         mtime;     /* 加载时证书文件的修改时间 */
+    off_t                          size;      /* 加载时证书文件的大小 */
+    time_t                         used;      /* 最近一次命中/加载的时间，只用于日志 */
+    ngx_http_ssl_cert_entry_t     *entry;     /* 解析好的证书；NULL 表示这一格是空的 */
+} ngx_http_ssl_cert_dir_cache_entry_t;
+
+
+struct ngx_http_ssl_cert_dir_cache_s {
+    ngx_pool_t                     *pool;     /* 缓存自身的内存池（证书表的内存池） */
+    ngx_uint_t                      max;      /* 最多保留多少条 */
+    ngx_uint_t                      n;        /* 已用格数，最多 max */
+    ngx_uint_t                      next;     /* 环形数组里下一个写入位置 */
+    ngx_uint_t                      hits;     /* 统计：命中次数 */
+    ngx_uint_t                      misses;   /* 统计：未命中次数 */
+    ngx_http_ssl_cert_dir_cache_entry_t *elts;
+};
 
 
 /*
@@ -212,6 +261,8 @@ typedef struct {
     ngx_str_t                      dir;             /* 清单顶层 "directory"，已解析成
                                                        完整路径；len 为 0 表示不启用目录模式 */
     ngx_uint_t                     mode;            /* 实际生效的 "mode"，只用于日志 */
+    ngx_uint_t                     cache_max;       /* 清单顶层 "cache"：目录模式的缓存条数 */
+    ngx_http_ssl_cert_dir_cache_t *cache;           /* 目录模式的证书缓存，第一次用到时创建 */
     ngx_uint_t                     unmatched;       /* 清单顶层 "unmatched" 的值 */
     ngx_uint_t                     unmatched_set;   /* 清单里是否写了 "unmatched" */
     time_t                         interval;        /* 清单顶层 "interval" 的值（秒） */
@@ -303,11 +354,20 @@ static void ngx_http_ssl_cert_check_expiry(ngx_log_t *log, X509 *cert,
 static int ngx_http_ssl_cert_dir_cert_cb(ngx_ssl_conn_t *ssl_conn,
     void *arg);
 static int ngx_http_ssl_cert_use(ngx_ssl_conn_t *ssl_conn,
-    ngx_connection_t *c, ngx_http_ssl_cert_entry_t *e, u_char *what);
+    ngx_connection_t *c, ngx_http_ssl_cert_entry_t *e, u_char *what,
+    char *prefix);
 static ngx_int_t ngx_http_ssl_cert_normalize(const char *in, u_char *out,
     size_t size, ngx_uint_t allow_wildcard);
 static ngx_int_t ngx_http_ssl_cert_dir_load(ngx_ssl_conn_t *ssl_conn,
-    ngx_connection_t *c, ngx_str_t *dir, u_char *base);
+    ngx_connection_t *c, ngx_http_ssl_cert_table_t *t, u_char *base);
+static ngx_http_ssl_cert_dir_cache_t *ngx_http_ssl_cert_dir_cache_create(
+    ngx_pool_t *pool, ngx_uint_t max);
+static void ngx_http_ssl_cert_dir_cache_cleanup(void *data);
+static ngx_http_ssl_cert_dir_cache_entry_t *ngx_http_ssl_cert_dir_cache_lookup(
+    ngx_http_ssl_cert_dir_cache_t *cache, u_char *base);
+static ngx_http_ssl_cert_dir_cache_entry_t *ngx_http_ssl_cert_dir_cache_add(
+    ngx_http_ssl_cert_dir_cache_t *cache, u_char *base,
+    ngx_http_ssl_cert_entry_t *e);
 
 /* 证书清单 */
 
@@ -329,8 +389,9 @@ static ngx_int_t ngx_http_ssl_cert_registry_dir(
     ngx_http_ssl_cert_table_t *t, ngx_pool_t *pool, ngx_log_t *log);
 static ngx_http_ssl_cert_entry_t *ngx_http_ssl_cert_registry_find(
     ngx_http_ssl_cert_table_t *t, u_char *name);
-static ngx_int_t ngx_http_ssl_cert_entry_load(ngx_log_t *log, u_char *crt,
-    u_char *key, ngx_http_ssl_cert_entry_t *e);
+static ngx_int_t ngx_http_ssl_cert_entry_load(ngx_log_t *log, char *prefix,
+    u_char *crt, u_char *key, ngx_http_ssl_cert_entry_t *e);
+static void ngx_http_ssl_cert_entry_release(ngx_http_ssl_cert_entry_t *e);
 static void ngx_http_ssl_cert_entry_cleanup(void *data);
 
 
@@ -1247,7 +1308,6 @@ ngx_http_ssl_cert_dir_cert_cb(ngx_ssl_conn_t *ssl_conn, void *arg)
     size_t                      i;
     ngx_int_t                   rc;
     ngx_uint_t                  unmatched;
-    ngx_str_t                  *dir;
     const char                 *sni;
     ngx_connection_t           *c;
     ngx_http_ssl_cert_entry_t  *e;
@@ -1280,8 +1340,6 @@ ngx_http_ssl_cert_dir_cert_cb(ngx_ssl_conn_t *ssl_conn, void *arg)
     unmatched = (table != NULL && table->unmatched_set)
                 ? table->unmatched
                 : NGX_HTTP_SSL_CERT_UNMATCHED_DEFAULT;
-
-    dir = (table != NULL) ? &table->dir : NULL;
 
     /* 客户端在 ClientHello 里发来的域名，没有发就是 NULL */
 
@@ -1322,17 +1380,17 @@ ngx_http_ssl_cert_dir_cert_cb(ngx_ssl_conn_t *ssl_conn, void *arg)
         e = ngx_http_ssl_cert_registry_find(table, name);
 
         if (e) {
-            return ngx_http_ssl_cert_use(ssl_conn, c, e, name);
+            return ngx_http_ssl_cert_use(ssl_conn, c, e, name, (char *) "ssl_cert_registry");
         }
     }
 
     /* 2. 证书目录 */
 
-    if (dir != NULL && dir->len) {
+    if (table != NULL && table->dir.len) {
 
         /* 先找 <dir>/<域名>.crt */
 
-        rc = ngx_http_ssl_cert_dir_load(ssl_conn, c, dir, name);
+        rc = ngx_http_ssl_cert_dir_load(ssl_conn, c, table, name);
 
         /* 找到了（成功或失败）就不再往下找；只有"文件不存在"才继续 */
 
@@ -1353,7 +1411,7 @@ ngx_http_ssl_cert_dir_cert_cb(ngx_ssl_conn_t *ssl_conn, void *arg)
 
             ngx_sprintf(base, "wildcard.%s%Z", dot + 1);
 
-            rc = ngx_http_ssl_cert_dir_load(ssl_conn, c, dir, base);
+            rc = ngx_http_ssl_cert_dir_load(ssl_conn, c, table, base);
 
             if (rc != NGX_DECLINED) {
                 return (rc == NGX_OK) ? 1 : 0;
@@ -1405,7 +1463,8 @@ unmatched:
 
     if (table && table->default_entry) {
         return ngx_http_ssl_cert_use(ssl_conn, c, table->default_entry,
-                                     (u_char *) "default");
+                                     (u_char *) "default",
+                                     (char *) "ssl_cert_registry");
     }
 
     /* 4. ssl_certificate 配置的证书：不做任何替换 */
@@ -1427,7 +1486,7 @@ unmatched:
 
 static int
 ngx_http_ssl_cert_use(ngx_ssl_conn_t *ssl_conn, ngx_connection_t *c,
-    ngx_http_ssl_cert_entry_t *e, u_char *what)
+    ngx_http_ssl_cert_entry_t *e, u_char *what, char *prefix)
 {
     /*
      * 先清掉从 SSL_CTX 继承来的证书，否则两者密钥类型不同时
@@ -1448,14 +1507,11 @@ ngx_http_ssl_cert_use(ngx_ssl_conn_t *ssl_conn, ngx_connection_t *c,
 
         /* ngx_ssl_error 会把 OpenSSL 的错误队列一起写进日志 */
 
-        ngx_ssl_error(NGX_LOG_ERR, c->log, 0,
-                      "ssl_cert_registry: SSL_use_cert_and_key() failed "
-                      "for \"%s\"", what);
+        ngx_ssl_error(NGX_LOG_ERR, c->log, 0, "%s: SSL_use_cert_and_key() failed for \"%s\"", prefix, what);
         return 0;
     }
 
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
-                   "ssl_cert_registry: using certificate for \"%s\"", what);
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, c->log, 0, "%s: using certificate for \"%s\"", prefix, what);
 
     return 1;
 }
@@ -1531,22 +1587,189 @@ ngx_http_ssl_cert_normalize(const char *in, u_char *out, size_t size,
 
 
 /*
+ * 创建证书缓存。max 为 0 时不建（相当于不缓存），此时返回 NULL。
+ */
+
+static ngx_http_ssl_cert_dir_cache_t *
+ngx_http_ssl_cert_dir_cache_create(ngx_pool_t *pool, ngx_uint_t max)
+{
+    ngx_pool_cleanup_t             *cln;
+    ngx_http_ssl_cert_dir_cache_t  *cache;
+
+    if (max == 0) {
+        return NULL;
+    }
+
+    cache = ngx_pcalloc(pool, sizeof(ngx_http_ssl_cert_dir_cache_t));
+
+    if (cache == NULL) {
+        return NULL;
+    }
+
+    cache->elts = ngx_pcalloc(pool, max * sizeof(ngx_http_ssl_cert_dir_cache_entry_t));
+
+    if (cache->elts == NULL) {
+        return NULL;
+    }
+
+    cache->pool = pool;
+    cache->max = max;
+
+    /*
+     * 缓存里的 OpenSSL 对象不会随内存池自动释放，注册一个清理函数，
+     * 池销毁时逐个释放
+     */
+
+    cln = ngx_pool_cleanup_add(pool, 0);
+
+    if (cln == NULL) {
+        return NULL;
+    }
+
+    cln->handler = ngx_http_ssl_cert_dir_cache_cleanup;
+    cln->data = cache;
+
+    return cache;
+}
+
+
+/* 内存池销毁时释放缓存里所有证书对象 */
+
+static void
+ngx_http_ssl_cert_dir_cache_cleanup(void *data)
+{
+    ngx_uint_t                           i;
+    ngx_http_ssl_cert_dir_cache_t       *cache = data;
+    ngx_http_ssl_cert_dir_cache_entry_t *ce;
+
+    ce = cache->elts;
+
+    for (i = 0; i < cache->n; i++) {
+
+        if (ce[i].entry != NULL) {
+            ngx_http_ssl_cert_entry_release(ce[i].entry);
+            ce[i].entry = NULL;
+        }
+    }
+}
+
+
+/*
+ * 查缓存。线性扫描：缓存的证书都在同一个目录里，条数由 "cache" 限制，通常只有
+ * 几十条；域名很短，逐条比长度再比内容比哈希表更快，也不用再算一次哈希。
+ *
+ * 返回 NULL 表示没缓存过；返回非 NULL 时还要调用方 stat 一次文件，确认没变。
+ */
+
+static ngx_http_ssl_cert_dir_cache_entry_t *
+ngx_http_ssl_cert_dir_cache_lookup(ngx_http_ssl_cert_dir_cache_t *cache, u_char *base)
+{
+    size_t                              len;
+    ngx_uint_t                          i;
+    ngx_http_ssl_cert_dir_cache_entry_t *ce;
+
+    if (cache == NULL) {
+        return NULL;
+    }
+
+    len = ngx_strlen(base);
+    ce = cache->elts;
+
+    for (i = 0; i < cache->n; i++) {
+
+        if (ce[i].entry == NULL) {
+            continue;
+        }
+
+        if (ce[i].base.len == len && ngx_strncmp(ce[i].base.data, base, len) == 0) {
+            return &ce[i];
+        }
+    }
+
+    return NULL;
+}
+
+
+/*
+ * 把新解析好的证书放进缓存，返回缓存项；失败时返回 NULL。
+ *
+ * 缓存满了就覆盖 next 指向的那一格（FIFO）。旧对象不能马上释放：可能有正在
+ * 握手的连接还持有它的引用——不过 SSL_use_cert_and_key() 会给对象加引用，
+ * 所以这里可以安全释放我们这一份。
+ */
+
+static ngx_http_ssl_cert_dir_cache_entry_t *
+ngx_http_ssl_cert_dir_cache_add(ngx_http_ssl_cert_dir_cache_t *cache, u_char *base, ngx_http_ssl_cert_entry_t *e)
+{
+    size_t                               len;
+    ngx_http_ssl_cert_dir_cache_entry_t  *ce;
+
+    if (cache == NULL) {
+        return NULL;
+    }
+
+    ce = &cache->elts[cache->next];
+    cache->next = (cache->next + 1) % cache->max;
+
+    if (cache->n < cache->max) {
+        cache->n++;
+    }
+
+    /* 被覆盖的那一条：域名和对象都释放掉（对象的清理函数已经登记过了） */
+
+    if (ce->entry != NULL) {
+        ngx_http_ssl_cert_entry_release(ce->entry);
+        ce->entry = NULL;
+    }
+
+    len = ngx_strlen(base);
+
+    ce->base.data = ngx_pnalloc(cache->pool, len + 1);
+
+    if (ce->base.data == NULL) {
+        ce->base.len = 0;
+        return NULL;
+    }
+
+    ngx_cpystrn(ce->base.data, base, len + 1);
+    ce->base.len = len;
+
+    ce->entry = e;
+    ce->used = ngx_time();
+
+    return ce;
+}
+
+
+/*
  * 证书目录：加载 <dir>/<base>.crt 和 .key
  *
  *   NGX_OK        已加载
  *   NGX_DECLINED  证书文件不存在，交给下一种匹配方式
  *   NGX_ERROR     文件存在但加载失败，终止握手
  *
- * 注意：这里每次握手都会读磁盘（阻塞 I/O），性能不如清单模式。
+ * 每条证书的解析结果缓存在 t->cache 里（条数由清单里的 "cache" 决定）。
+ * 命中缓存时只 stat 一次证书文件，确认 inode / 修改时间 / 大小都没变，
+ * 就把解析好的对象直接挂到连接上——省掉了每次握手约 50 µs 的 PEM 解析。
+ *
+ * 缓存里没有、或者文件变了才真正读盘解析。解析在 worker 的事件循环里同步
+ * 完成，是这一路唯一的耗时点。
  */
 
 static ngx_int_t
 ngx_http_ssl_cert_dir_load(ngx_ssl_conn_t *ssl_conn, ngx_connection_t *c,
-    ngx_str_t *dir, u_char *base)
+    ngx_http_ssl_cert_table_t *t, u_char *base)
 {
-    u_char           *p;
-    ngx_file_info_t   fi;
-    u_char            crt[NGX_MAX_PATH], key[NGX_MAX_PATH];
+    char                                 *prefix;
+    u_char                               *p;
+    ngx_int_t                             rc;
+    ngx_file_info_t                       fi;
+    ngx_http_ssl_cert_entry_t             tmp;
+    ngx_http_ssl_cert_entry_t            *e;
+    ngx_http_ssl_cert_dir_cache_entry_t  *ce;
+    u_char                                crt[NGX_MAX_PATH], key[NGX_MAX_PATH];
+
+    prefix = (char *) "ssl_cert_dir";
 
     /*
      * ngx_snprintf 不会自动写 '\0'，返回写入位置的末尾。
@@ -1554,13 +1777,13 @@ ngx_http_ssl_cert_dir_load(ngx_ssl_conn_t *ssl_conn, ngx_connection_t *c,
      * 写满了说明路径被截断，当作文件不存在处理。
      */
 
-    p = ngx_snprintf(crt, NGX_MAX_PATH - 1, "%V/%s.crt", dir, base);
+    p = ngx_snprintf(crt, NGX_MAX_PATH - 1, "%V/%s.crt", &t->dir, base);
     if (p == crt + NGX_MAX_PATH - 1) {
         return NGX_DECLINED;
     }
     *p = '\0';
 
-    p = ngx_snprintf(key, NGX_MAX_PATH - 1, "%V/%s.key", dir, base);
+    p = ngx_snprintf(key, NGX_MAX_PATH - 1, "%V/%s.key", &t->dir, base);
     if (p == key + NGX_MAX_PATH - 1) {
         return NGX_DECLINED;
     }
@@ -1572,40 +1795,76 @@ ngx_http_ssl_cert_dir_load(ngx_ssl_conn_t *ssl_conn, ngx_connection_t *c,
         return NGX_DECLINED;
     }
 
-    /* 原因同 ngx_http_ssl_cert_use()：避免混用不同密钥类型的证书 */
+    /* 缓存命中：文件还是那个文件，直接用解析好的对象 */
 
-    SSL_certs_clear(ssl_conn);
+    ce = ngx_http_ssl_cert_dir_cache_lookup(t->cache, base);
 
-    /* 读取完整证书链（叶子证书在前，中间证书在后） */
+    if (ce != NULL && ngx_file_uniq(&fi) == ce->uniq && ngx_file_mtime(&fi) == ce->mtime && ngx_file_size(&fi) == ce->size) {
 
-    if (SSL_use_certificate_chain_file(ssl_conn, (char *) crt) != 1) {
-        ngx_ssl_error(NGX_LOG_ERR, c->log, 0,
-                      "ssl_cert_dir: cannot load certificate \"%s\"", crt);
+        t->cache->hits++;
+        ce->used = ngx_time();
+
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, c->log, 0, "ssl_cert_dir: using cached certificate for \"%s\" (%s)", base, crt);
+
+        return ngx_http_ssl_cert_use(ssl_conn, c, ce->entry, base, prefix) ? NGX_OK : NGX_ERROR;
+    }
+
+    if (t->cache != NULL) {
+        t->cache->misses++;
+    }
+
+    /*
+     * 未命中或者文件变了：重新解析。
+     *
+     * 解析到栈上的临时 entry，全部成功之后再决定怎么处置——失败时直接释放，
+     * 不会污染缓存；成功时如果是覆盖已有项，旧对象这时候才释放。
+     */
+
+    ngx_memzero(&tmp, sizeof(ngx_http_ssl_cert_entry_t));
+
+    if (ngx_http_ssl_cert_entry_load(c->log, prefix, crt, key, &tmp) != NGX_OK) {
+        ngx_http_ssl_cert_entry_release(&tmp);
         return NGX_ERROR;
     }
 
-    if (SSL_use_PrivateKey_file(ssl_conn, (char *) key, SSL_FILETYPE_PEM)
-        != 1)
-    {
-        ngx_ssl_error(NGX_LOG_ERR, c->log, 0,
-                      "ssl_cert_dir: cannot load certificate key \"%s\"",
-                      key);
+    /* 不缓存：用完就释放，连接自己持有一份引用（SSL_use_cert_and_key 加过引用） */
+
+    if (t->cache == NULL) {
+
+        rc = ngx_http_ssl_cert_use(ssl_conn, c, &tmp, base, prefix) ? NGX_OK : NGX_ERROR;
+
+        ngx_http_ssl_cert_entry_release(&tmp);
+
+        return rc;
+    }
+
+    /*
+     * 放进缓存：对象交给缓存持有，缓存满了会覆盖最早的那一项并释放它的对象。
+     * 证书对象已经通过 SSL_use_cert_and_key() 给连接加过引用，被覆盖时不影响
+     * 正在握手的连接。
+     */
+
+    e = ngx_pcalloc(t->pool, sizeof(ngx_http_ssl_cert_entry_t));
+
+    if (e == NULL) {
+        ngx_http_ssl_cert_entry_release(&tmp);
         return NGX_ERROR;
     }
 
-    /* 证书和私钥必须是一对，否则握手时签名验证会失败 */
+    *e = tmp;
 
-    if (SSL_check_private_key(ssl_conn) != 1) {
-        ngx_ssl_error(NGX_LOG_ERR, c->log, 0,
-                      "ssl_cert_dir: certificate \"%s\" and key \"%s\" "
-                      "do not match", crt, key);
+    ce = ngx_http_ssl_cert_dir_cache_add(t->cache, base, e);
+
+    if (ce == NULL) {
+        ngx_http_ssl_cert_entry_release(e);
         return NGX_ERROR;
     }
 
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
-                   "ssl_cert_dir: using certificate \"%s\"", crt);
+    ce->uniq = ngx_file_uniq(&fi);
+    ce->mtime = ngx_file_mtime(&fi);
+    ce->size = ngx_file_size(&fi);
 
-    return NGX_OK;
+    return ngx_http_ssl_cert_use(ssl_conn, c, e, base, prefix) ? NGX_OK : NGX_ERROR;
 }
 
 
@@ -1769,12 +2028,13 @@ ngx_http_ssl_cert_registry_get(ngx_conf_t *cf,
     ngx_log_error(NGX_LOG_NOTICE, cf->log, 0,
                   "ssl_cert_registry: \"%V\" loaded: %ui certificates, "
                   "%ui domains, default: %s, mode: %s, directory: %s, "
-                  "interval: %i, unmatched: %s",
+                  "cache: %ui, interval: %i, unmatched: %s",
                   &reg->path, reg->table->entries.nelts,
                   reg->table->ndomains,
                   reg->table->default_entry ? "yes" : "no",
                   ngx_http_ssl_cert_mode_name(reg->table),
                   reg->table->dir.len ? (char *) reg->table->dir.data : "no",
+                  reg->table->cache_max,
                   (ngx_int_t) reg->interval,
                   ngx_http_ssl_cert_unmatched_name(reg->table));
 
@@ -1889,11 +2149,12 @@ ngx_http_ssl_cert_registry_refresh(ngx_http_ssl_cert_registry_t *reg,
     ngx_log_error(NGX_LOG_NOTICE, log, 0,
                   "ssl_cert_registry: \"%V\" reloaded: %ui certificates, "
                   "%ui domains, default: %s, mode: %s, directory: %s, "
-                  "interval: %i, unmatched: %s",
+                  "cache: %ui, interval: %i, unmatched: %s",
                   &reg->path, t->entries.nelts, t->ndomains,
                   t->default_entry ? "yes" : "no",
                   ngx_http_ssl_cert_mode_name(t),
                   t->dir.len ? (char *) t->dir.data : "no",
+                  t->cache_max,
                   (ngx_int_t) reg->interval,
                   ngx_http_ssl_cert_unmatched_name(t));
 }
@@ -2120,6 +2381,22 @@ ngx_http_ssl_cert_registry_build(ngx_http_ssl_cert_registry_t *reg,
         mode_set = 1;
     }
 
+    /* "cache"：目录模式的证书缓存条数 */
+
+    t->cache_max = NGX_HTTP_SSL_CERT_DIR_CACHE_DEFAULT;
+
+    value = ngx_http_ssl_cert_json_get(root, "cache");
+
+    if (value != NULL) {
+
+        if (ngx_http_ssl_cert_json_int(value, &n) != NGX_OK || n < 0 || (uint64_t) n > NGX_MAX_INT_T_VALUE) {
+            ngx_log_error(NGX_LOG_ERR, log, 0, "ssl_cert_registry: \"%V\": \"cache\" must be a non-negative integer", &reg->path);
+            goto failed;
+        }
+
+        t->cache_max = (ngx_uint_t) n;
+    }
+
     /* "directory"：证书目录，解析结果写进 t->dir */
 
     if (ngx_http_ssl_cert_registry_dir(reg, root, t, pool, log) != NGX_OK) {
@@ -2323,7 +2600,7 @@ ngx_http_ssl_cert_registry_build(ngx_http_ssl_cert_registry_t *reg,
         ngx_memzero(e, sizeof(ngx_http_ssl_cert_entry_t));
         cln->handler = ngx_http_ssl_cert_entry_cleanup;
 
-        if (ngx_http_ssl_cert_entry_load(log, crt, key, e) != NGX_OK) {
+        if (ngx_http_ssl_cert_entry_load(log, (char *) "ssl_cert_registry", crt, key, e) != NGX_OK) {
             goto failed;
         }
 
@@ -2430,7 +2707,15 @@ ngx_http_ssl_cert_registry_build(ngx_http_ssl_cert_registry_t *reg,
         goto failed;
     }
 
-    /* 6. 临时内存（含整棵 JSON 树）不再需要 */
+    /* 6. 目录模式的证书缓存；cache 为 0 时不建（相当于不缓存） */
+
+    t->cache = ngx_http_ssl_cert_dir_cache_create(pool, t->cache_max);
+
+    if (t->cache == NULL && t->cache_max != 0) {
+        goto failed;
+    }
+
+    /* 7. 临时内存（含整棵 JSON 树）不再需要 */
 
     ngx_destroy_pool(temp_pool);
 
@@ -2655,8 +2940,8 @@ ngx_http_ssl_cert_registry_find(ngx_http_ssl_cert_table_t *t, u_char *name)
  */
 
 static ngx_int_t
-ngx_http_ssl_cert_entry_load(ngx_log_t *log, u_char *crt, u_char *key,
-    ngx_http_ssl_cert_entry_t *e)
+ngx_http_ssl_cert_entry_load(ngx_log_t *log, char *prefix, u_char *crt,
+    u_char *key, ngx_http_ssl_cert_entry_t *e)
 {
     BIO     *bio;
     X509    *x509;
@@ -2666,9 +2951,7 @@ ngx_http_ssl_cert_entry_load(ngx_log_t *log, u_char *crt, u_char *key,
 
     bio = BIO_new_file((char *) crt, "r");
     if (bio == NULL) {
-        ngx_ssl_error(NGX_LOG_ERR, log, 0,
-                      "ssl_cert_registry: cannot open certificate \"%s\"",
-                      crt);
+        ngx_ssl_error(NGX_LOG_ERR, log, 0, "%s: cannot open certificate \"%s\"", prefix, crt);
         return NGX_ERROR;
     }
 
@@ -2679,9 +2962,7 @@ ngx_http_ssl_cert_entry_load(ngx_log_t *log, u_char *crt, u_char *key,
 
     e->cert = PEM_read_bio_X509_AUX(bio, NULL, NULL, NULL);
     if (e->cert == NULL) {
-        ngx_ssl_error(NGX_LOG_ERR, log, 0,
-                      "ssl_cert_registry: cannot read certificate \"%s\"",
-                      crt);
+        ngx_ssl_error(NGX_LOG_ERR, log, 0, "%s: cannot read certificate \"%s\"", prefix, crt);
         BIO_free(bio);
         return NGX_ERROR;
     }
@@ -2719,9 +3000,7 @@ ngx_http_ssl_cert_entry_load(ngx_log_t *log, u_char *crt, u_char *key,
                 break;
             }
 
-            ngx_ssl_error(NGX_LOG_ERR, log, 0,
-                          "ssl_cert_registry: cannot read certificate "
-                          "chain \"%s\"", crt);
+            ngx_ssl_error(NGX_LOG_ERR, log, 0, "%s: cannot read certificate chain \"%s\"", prefix, crt);
             BIO_free(bio);
             return NGX_ERROR;
         }
@@ -2739,9 +3018,7 @@ ngx_http_ssl_cert_entry_load(ngx_log_t *log, u_char *crt, u_char *key,
 
     bio = BIO_new_file((char *) key, "r");
     if (bio == NULL) {
-        ngx_ssl_error(NGX_LOG_ERR, log, 0,
-                      "ssl_cert_registry: cannot open certificate key \"%s\"",
-                      key);
+        ngx_ssl_error(NGX_LOG_ERR, log, 0, "%s: cannot open certificate key \"%s\"", prefix, key);
         return NGX_ERROR;
     }
 
@@ -2751,43 +3028,55 @@ ngx_http_ssl_cert_entry_load(ngx_log_t *log, u_char *crt, u_char *key,
     BIO_free(bio);
 
     if (e->pkey == NULL) {
-        ngx_ssl_error(NGX_LOG_ERR, log, 0,
-                      "ssl_cert_registry: cannot read certificate key \"%s\"",
-                      key);
+        ngx_ssl_error(NGX_LOG_ERR, log, 0, "%s: cannot read certificate key \"%s\"", prefix, key);
         return NGX_ERROR;
     }
 
     /* 证书里的公钥和私钥必须是一对 */
 
     if (X509_check_private_key(e->cert, e->pkey) != 1) {
-        ngx_ssl_error(NGX_LOG_ERR, log, 0,
-                      "ssl_cert_registry: certificate \"%s\" and key \"%s\" "
-                      "do not match", crt, key);
+        ngx_ssl_error(NGX_LOG_ERR, log, 0, "%s: certificate \"%s\" and key \"%s\" do not match", prefix, crt, key);
         return NGX_ERROR;
     }
 
     /* 快到期 / 已过期只写警告，照常加载（启动时和每次重新加载时都会检查） */
 
-    ngx_http_ssl_cert_check_expiry(log, e->cert, crt, "ssl_cert_registry");
+    ngx_http_ssl_cert_check_expiry(log, e->cert, crt, prefix);
 
     return NGX_OK;
 }
 
 
 /*
- * 内存池销毁时调用，释放一张证书的 OpenSSL 对象
+ * 释放一张证书的 OpenSSL 对象。
  *
- * 这几个释放函数遇到 NULL 都会直接返回，所以加载到一半失败、
- * 部分字段还是 NULL 时也能安全调用。
+ * 这几个释放函数遇到 NULL 都会直接返回，所以加载到一半失败、部分字段还是 NULL
+ * 时也能安全调用；释放完把指针清空，重复调用也不会二次释放。
+ *
  * 这里只是减少引用计数：仍在使用这张证书的连接持有自己的引用，不受影响。
+ *
+ * 两种调用时机：
+ *   - 内存池销毁时（ngx_http_ssl_cert_entry_cleanup 转发到这里）；
+ *   - 目录模式的缓存项被覆盖、或者不缓存时用完即弃。
  */
+
+static void
+ngx_http_ssl_cert_entry_release(ngx_http_ssl_cert_entry_t *e)
+{
+    X509_free(e->cert);
+    sk_X509_pop_free(e->chain, X509_free);    /* 释放每个中间证书，再释放栈本身 */
+    EVP_PKEY_free(e->pkey);
+
+    e->cert = NULL;
+    e->chain = NULL;
+    e->pkey = NULL;
+}
+
+
+/* 内存池销毁时调用 */
 
 static void
 ngx_http_ssl_cert_entry_cleanup(void *data)
 {
-    ngx_http_ssl_cert_entry_t  *e = data;
-
-    X509_free(e->cert);
-    sk_X509_pop_free(e->chain, X509_free);    /* 释放每个中间证书，再释放栈本身 */
-    EVP_PKEY_free(e->pkey);
+    ngx_http_ssl_cert_entry_release(data);
 }

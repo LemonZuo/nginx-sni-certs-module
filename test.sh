@@ -91,8 +91,9 @@ write_both() {   # $1 = 是否包含 d.test，$2 = 默认证书
 }
 
 # 只有 directory、没有 certificates 的清单
+#   $1 = 目录，$2 = 额外的顶层字段（可选，如 '"cache": 0,'）
 write_dir_registry() {
-    printf '{\n  "interval": 0,\n  "directory": "%s"\n}\n' "$1" \
+    printf '{\n  "interval": 0,\n%s  "directory": "%s"\n}\n' "${2:-}" "$1" \
         > /registry/dir.json.tmp
     mv /registry/dir.json.tmp /registry/dir.json
 }
@@ -174,6 +175,7 @@ sleep 1
 pass=0
 fail=0
 REGDEF=CN=registry-default.invalid
+LOG=/tmp/ng/logs/error.log
 
 subject() {
     openssl s_client -connect "127.0.0.1:$1" $2 </dev/null 2>/dev/null \
@@ -204,6 +206,56 @@ check 9443 unknown.test   CN=default.invalid
 check 9443 "(无SNI)"      CN=default.invalid
 check 9443 bad..name      CN=default.invalid
 
+echo "== 目录模式的证书缓存"
+# 用独立域名，避免影响后面 a.test 的期望值
+ec /certs cache.test /CN=cache.test
+chown root:nobody /certs/cache.test.key && chmod 640 /certs/cache.test.key
+check 9443 cache.test     CN=cache.test
+
+assert '目录模式：加载时打印 cache 条数' \
+    grep -q '"/registry/dir.json" loaded:.*cache: 1024,' $LOG
+
+# 缓存命中后换掉证书文件：靠 inode/修改时间/大小发现，下一次握手就该拿到新证书
+ec /certs cache.test /CN=cache.test/O=rotated
+chown root:nobody /certs/cache.test.key && chmod 640 /certs/cache.test.key
+check 9443 cache.test     CN=cache.test,O=rotated
+
+# cache: 0 时不建缓存，每次握手都读盘，改文件立即生效
+write_dir_registry /certs '"cache": 0,'
+sleep 2
+ec /certs cache.test /CN=cache.test/O=nocache
+chown root:nobody /certs/cache.test.key && chmod 640 /certs/cache.test.key
+check 9443 cache.test     CN=cache.test,O=nocache
+assert '目录模式：cache 为 0 时不建缓存' \
+    grep -q '"/registry/dir.json" reloaded:.*cache: 0,' $LOG
+
+# 非法 cache 值：整份清单不生效，继续用旧的（cache: 0，所以改文件立即生效）
+# 负数在 JSON 解析阶段就被拒了（解析器不支持负数）
+write_dir_registry /certs '"cache": -1,'
+check 9443 cache.test     CN=cache.test,O=nocache
+assert 'cache 不能是负数' \
+    grep -q 'negative numbers are not supported' $LOG
+
+write_dir_registry /certs '"cache": "big",'
+check 9443 cache.test     CN=cache.test,O=nocache
+assert 'cache 不是整数时报错' \
+    grep -q '"cache" must be a non-negative integer' $LOG
+
+# 缓存只有 1 条：两个域名轮流访问会互相淘汰，结果仍然必须正确
+write_dir_registry /certs '"cache": 1,'
+sleep 2
+check 9443 a.test         CN=a.test
+check 9443 b.test         CN=b.test
+check 9443 a.test         CN=a.test
+check 9443 b.test         CN=b.test
+check 9443 cache.test     CN=cache.test,O=nocache
+assert '目录模式：缓存条数为 1 时能加载' \
+    grep -q '"/registry/dir.json" reloaded:.*cache: 1,' $LOG
+
+write_dir_registry /certs                       # 恢复默认缓存
+sleep 2
+check 9443 cache.test     CN=cache.test,O=nocache
+
 echo "== 清单模式（9444）：清单里有 isDefault 的占位证书"
 check 9444 a.test         CN=a.test
 check 9444 b.test         CN=b.test
@@ -226,7 +278,6 @@ check 9445 "(无SNI)"      握手失败
 check 9445 'x"y.test'     握手失败               # 不合法的 SNI，日志里引号被替换成 ?
 
 echo "== 匹配不上时的 info 日志"
-LOG=/tmp/ng/logs/error.log
 assert '目录模式：回退到 ssl_certificate'  grep -q 'no certificate for "unknown.test", using "ssl_certificate"' $LOG
 assert '清单模式：使用 isDefault 证书'      grep -q 'no certificate for "unknown.test", using the "isDefault" certificate' $LOG
 assert 'reject：记录拒绝的域名'            grep -q 'no certificate for "unknown.test", handshake rejected' $LOG
