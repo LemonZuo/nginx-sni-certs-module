@@ -170,6 +170,7 @@ http {
 
 ```json
 {
+  "mode": "both",
   "interval": 5,
   "unmatched": "reject",
   "directory": "certs",
@@ -220,6 +221,7 @@ http {
 
 ```json
 {
+  "mode": "both",
   "interval": 5,
   "unmatched": "default",
   "directory": "certs",
@@ -250,8 +252,35 @@ http {
 |---|---|---|
 | `certificates` | 否* | 证书数组。和 `directory` 至少要有一个 |
 | `directory` | 否* | 证书目录。相对路径按清单文件所在目录解析 |
+| `mode` | 否 | `certificates` / `directory` / `both`，显式声明用哪种来源；**必须和实际配了哪些字段一致**，见下文 |
 | `interval` | 否 | 检查间隔。整数表示秒，也可以写成 `"5s"`、`"1m"`；`0` 表示每次握手都检查；默认 5 |
 | `unmatched` | 否 | `default` 或 `reject`，默认 `default` |
+
+### mode：显式声明用哪种来源
+
+不写 `mode` 时，模块按"配了哪些字段"自动判断：只配 `certificates` 就是清单模式，只配 `directory` 就是目录模式，两个都配就都用。
+
+写了 `mode` 就必须和实际字段**完全一致**，否则整份清单不生效：
+
+| `mode` | 要求 |
+|---|---|
+| `"certificates"` | 必须有 `certificates`，且**不能**有 `directory` |
+| `"directory"` | 必须有 `directory`，且**不能**有 `certificates` |
+| `"both"` | `certificates` 和 `directory` 都要有 |
+
+不一致时报错，例如：
+
+```text
+[error] ssl_cert_registry: "/etc/nginx/ssl/certs.json": "mode" is "certificates" but "directory" is also set
+```
+
+这么设计的原因：清单通常由脚本生成或手工维护，改了字段忘了改 `mode`（或反过来）多半是改了一半。报错比"按其中一个执行"安全得多。想临时停用某个来源，就删掉对应的字段，别留着它在旁边。
+
+`mode` 只影响校验，不影响运行时的匹配逻辑——校验通过之后，实际行为完全由字段决定。加载成功时日志里会打印生效的 mode：
+
+```text
+[notice] ssl_cert_registry: "/etc/nginx/ssl/certs.json" loaded: 2 certificates, 3 domains, default: yes, mode: both, directory: /etc/nginx/ssl/certs, interval: 5, unmatched: default
+```
 
 ### 每条证书记录
 
@@ -421,6 +450,7 @@ NGINX_VERSION=1.31.6 ./test.sh   # 指定版本
 - 清单顶层配置（9447）：`interval` 支持整数和 `"5s"` 形式、`interval: 0` 时下一次握手即生效、删除 `interval` 后回落到默认值；
 - JSON 解析（19 项）：顶层不是对象、末尾有多余内容、空文件、`null`、负数、小数、前导零、数字溢出、`\u` 转义、未知转义、字符串没有结束、成员名重复、缺冒号、缺逗号、对象/数组没有结束、嵌套太深、字符串里有控制字符 —— 每一种都必须整份清单不生效并保留旧表；
 - `directory`：只有 `directory` 的清单、相对路径按清单目录解析、空字符串、`certificates` 和 `directory` 都缺失；
+- `mode`（11 项）：三种取值与实际字段一致时正常加载、不写时按字段推断；`mode` 与字段不一致（配了多余字段、缺了对应字段）、取值非法、不是字符串时整份清单不生效；
 - 匹配不上的 info 日志：三种结尾都有、非法 SNI 里的引号被替换、带客户端地址、没有 crit 日志；
 - 启动检查（单独的配置跑 `nginx -t`）：私钥不可读、目录进不去（同一目录只报一次）、30 天内到期、已过期、目录模式的证书；`user root` 时不检查权限；正常配置没有误报；
 - 热更新：不 reload nginx，往清单里加证书后生效；

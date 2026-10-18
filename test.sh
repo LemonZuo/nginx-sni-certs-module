@@ -312,6 +312,39 @@ raw_error '解析：数组没有结束'      '{ "a": [1'              'the array
 raw_error '解析：嵌套太深'          '[[[[[[[[[[1]]]]]]]]]]'   'too many nested levels'
 raw_error '解析：字符串里有控制字符' "$(printf '{"a": "x\ny"}')" 'control character in the string'
 
+echo "== 清单顶层的 mode：必须和实际配了哪些字段一致"
+ACERT='"certificates": [ { "domains": ["a.test"], "cert": "/certs/a.test.crt", "key": "/certs/a.test.key" } ]'
+
+mode_ok() {   # $1 = 描述，$2 = 清单内容，$3 = 期望日志里的 mode
+    printf '%s' "$2" > /registry/policy.json.tmp
+    mv /registry/policy.json.tmp /registry/policy.json
+    check 9447 a.test     CN=a.test
+    assert "$1" sh -c "grep 'policy.json\" reloaded' $LOG | tail -1 | grep -q 'mode: $3,'"
+}
+
+mode_bad() {  # $1 = 描述，$2 = 清单内容，$3 = 期望的错误片段
+    printf '%s' "$2" > /registry/policy.json.tmp
+    mv /registry/policy.json.tmp /registry/policy.json
+    check 9447 a.test     CN=a.test
+    assert "$1" grep -q "$3" $LOG
+}
+
+mode_ok  'mode=certificates 与实际一致' "{ \"interval\": 0, \"mode\": \"certificates\", $ACERT }" certificates
+mode_ok  'mode=directory 与实际一致'    '{ "interval": 0, "mode": "directory", "directory": "/certs" }' directory
+mode_ok  'mode=both 与实际一致'         "{ \"interval\": 0, \"mode\": \"both\", \"directory\": \"/certs\", $ACERT }" both
+mode_ok  '不写 mode 时按字段推断'       "{ \"interval\": 0, $ACERT }" certificates
+
+mode_bad 'mode=certificates 却配了 directory' "{ \"interval\": 0, \"mode\": \"certificates\", \"directory\": \"/certs\", $ACERT }" '"mode" is "certificates" but "directory" is also set'
+mode_bad 'mode=directory 却配了 certificates' '{ "interval": 0, "mode": "directory", "directory": "/certs", "certificates": [] }' '"mode" is "directory" but "certificates" is also set'
+mode_bad 'mode=directory 却没有 directory'    "{ \"interval\": 0, \"mode\": \"directory\", $ACERT }" '"mode" is "directory" but "directory" is not present'
+mode_bad 'mode=certificates 却没有 certificates' '{ "interval": 0, "mode": "certificates", "directory": "/certs" }' '"mode" is "certificates" but "certificates" is not present'
+mode_bad 'mode=both 但只有 certificates'      "{ \"interval\": 0, \"mode\": \"both\", $ACERT }" '"mode" is "both" but "certificates" and "directory" must both be present'
+mode_bad 'mode 取值非法'                      '{ "interval": 0, "mode": "cert", "certificates": [] }' 'got "cert"'
+mode_bad 'mode 不是字符串'                    '{ "interval": 0, "mode": 1, "certificates": [] }' '"mode" must be "certificates", "directory" or "both"'
+
+# 恢复成可用的清单，后面的用例还要用 9447
+write_policy_registry '"interval": 0,' '"unmatched": "default",' yes
+
 echo "== 热更新：往清单里加入 d.test（不 reload nginx）"
 write_both yes placeholder
 sleep 2

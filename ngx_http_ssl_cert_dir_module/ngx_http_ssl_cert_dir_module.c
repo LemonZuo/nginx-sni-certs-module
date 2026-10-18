@@ -34,6 +34,9 @@
  *     "interval": 5,                           可选，检查间隔（秒或 "5s"/"1m"），
  *                                              默认 5，0 表示每次握手都检查
  *     "unmatched": "default",                  可选，default | reject，默认 default
+ *     "mode": "both",                          可选，certificates | directory | both，
+ *                                              显式声明用哪种来源；不写就按实际
+ *                                              配了哪些字段推断，写了就必须一致
  *     "directory": "certs",                    可选，证书目录；相对路径按清单文件
  *                                              所在目录解析
  *     "certificates": [                        可选，但和 "directory" 至少有一个
@@ -167,6 +170,13 @@
 #define NGX_HTTP_SSL_CERT_UNMATCHED_REJECT   1   /* 拒绝握手 */
 
 
+/* 清单顶层 "mode" 的取值：用哪种证书来源 */
+
+#define NGX_HTTP_SSL_CERT_MODE_CERTIFICATES  0   /* 只用 certificates */
+#define NGX_HTTP_SSL_CERT_MODE_DIRECTORY     1   /* 只用 directory */
+#define NGX_HTTP_SSL_CERT_MODE_BOTH          2   /* 两者都用 */
+
+
 /* ---------------------------------------------------------------------- */
 /* 数据结构                                                               */
 /* ---------------------------------------------------------------------- */
@@ -201,6 +211,7 @@ typedef struct {
     ngx_uint_t                     ndomains;        /* 登记了多少个域名（用于日志） */
     ngx_str_t                      dir;             /* 清单顶层 "directory"，已解析成
                                                        完整路径；len 为 0 表示不启用目录模式 */
+    ngx_uint_t                     mode;            /* 实际生效的 "mode"，只用于日志 */
     ngx_uint_t                     unmatched;       /* 清单顶层 "unmatched" 的值 */
     ngx_uint_t                     unmatched_set;   /* 清单里是否写了 "unmatched" */
     time_t                         interval;        /* 清单顶层 "interval" 的值（秒） */
@@ -302,6 +313,7 @@ static ngx_int_t ngx_http_ssl_cert_dir_load(ngx_ssl_conn_t *ssl_conn,
 
 static const char *ngx_http_ssl_cert_unmatched_name(
     ngx_http_ssl_cert_table_t *t);
+static const char *ngx_http_ssl_cert_mode_name(ngx_http_ssl_cert_table_t *t);
 static ngx_http_ssl_cert_registry_t *ngx_http_ssl_cert_registry_get(
     ngx_conf_t *cf, ngx_http_ssl_cert_dir_main_conf_t *mcf, ngx_str_t *path);
 static void ngx_http_ssl_cert_registry_cleanup(void *data);
@@ -1601,6 +1613,25 @@ ngx_http_ssl_cert_dir_load(ngx_ssl_conn_t *ssl_conn, ngx_connection_t *c,
 /* 证书清单                                                               */
 /* ---------------------------------------------------------------------- */
 
+/* 日志用：实际生效的 "mode" */
+
+static const char *
+ngx_http_ssl_cert_mode_name(ngx_http_ssl_cert_table_t *t)
+{
+    switch (t->mode) {
+
+    case NGX_HTTP_SSL_CERT_MODE_DIRECTORY:
+        return "directory";
+
+    case NGX_HTTP_SSL_CERT_MODE_BOTH:
+        return "both";
+
+    default:
+        return "certificates";
+    }
+}
+
+
 /* 日志用：清单里 "unmatched" 的值 */
 
 static const char *
@@ -1737,11 +1768,12 @@ ngx_http_ssl_cert_registry_get(ngx_conf_t *cf,
 
     ngx_log_error(NGX_LOG_NOTICE, cf->log, 0,
                   "ssl_cert_registry: \"%V\" loaded: %ui certificates, "
-                  "%ui domains, default: %s, directory: %s, interval: %i, "
-                  "unmatched: %s",
+                  "%ui domains, default: %s, mode: %s, directory: %s, "
+                  "interval: %i, unmatched: %s",
                   &reg->path, reg->table->entries.nelts,
                   reg->table->ndomains,
                   reg->table->default_entry ? "yes" : "no",
+                  ngx_http_ssl_cert_mode_name(reg->table),
                   reg->table->dir.len ? (char *) reg->table->dir.data : "no",
                   (ngx_int_t) reg->interval,
                   ngx_http_ssl_cert_unmatched_name(reg->table));
@@ -1856,10 +1888,11 @@ ngx_http_ssl_cert_registry_refresh(ngx_http_ssl_cert_registry_t *reg,
 
     ngx_log_error(NGX_LOG_NOTICE, log, 0,
                   "ssl_cert_registry: \"%V\" reloaded: %ui certificates, "
-                  "%ui domains, default: %s, directory: %s, interval: %i, "
-                  "unmatched: %s",
+                  "%ui domains, default: %s, mode: %s, directory: %s, "
+                  "interval: %i, unmatched: %s",
                   &reg->path, t->entries.nelts, t->ndomains,
                   t->default_entry ? "yes" : "no",
+                  ngx_http_ssl_cert_mode_name(t),
                   t->dir.len ? (char *) t->dir.data : "no",
                   (ngx_int_t) reg->interval,
                   ngx_http_ssl_cert_unmatched_name(t));
@@ -1873,13 +1906,12 @@ ngx_http_ssl_cert_registry_refresh(ngx_http_ssl_cert_registry_t *reg,
  * 步骤：
  *   1. jansson 解析 JSON 文件
  *   2. 创建两个内存池：pool 给新表用，temp_pool 只在建表时用
- *   3. 处理顶层字段 interval / unmatched / directory
+ *   3. 处理顶层字段 interval / unmatched / mode / directory
  *   4. 逐条处理 certificates：校验字段 -> 读 PEM -> 把每个域名加进哈希 key 列表
  *   5. ngx_hash_init() 根据 key 列表生成最终的哈希表
  *   6. 销毁 temp_pool，返回新表
  *
- * "certificates" 和 "directory" 至少要有一个；只有 directory 时，哈希表是空的，
- * 握手时只走目录模式。
+ * "certificates" 和 "directory" 至少要有一个；只有 directory 时，哈希表是空的，握手时只走目录模式。写了 "mode" 时，它必须和实际配了哪些字段一致。
  *
  * 出错时销毁两个内存池（已经读进来的 OpenSSL 对象由 cleanup 释放）并返回 NULL。
  */
@@ -1891,6 +1923,7 @@ ngx_http_ssl_cert_registry_build(ngx_http_ssl_cert_registry_t *reg,
     size_t                      i, j;
     ngx_int_t                   rc;
     ngx_uint_t                  is_default, enabled_on, isdef_on;
+    ngx_uint_t                  mode, mode_set, has_certs, has_dir;
     int64_t                     n;
     ngx_int_t                   tt;
     ngx_str_t                   name, tv, *sv;
@@ -2054,42 +2087,126 @@ ngx_http_ssl_cert_registry_build(ngx_http_ssl_cert_registry_t *reg,
         t->unmatched_set = 1;
     }
 
+    /* "mode"：可选，显式声明用哪种证书来源；和实际字段是否一致在下面校验 */
+
+    mode = NGX_HTTP_SSL_CERT_MODE_CERTIFICATES;
+    mode_set = 0;
+
+    value = ngx_http_ssl_cert_json_get(root, "mode");
+
+    if (value != NULL) {
+
+        sv = ngx_http_ssl_cert_json_string(value);
+
+        if (sv == NULL) {
+            ngx_log_error(NGX_LOG_ERR, log, 0, "ssl_cert_registry: \"%V\": \"mode\" must be \"certificates\", \"directory\" or \"both\"", &reg->path);
+            goto failed;
+        }
+
+        if (ngx_strcmp(sv->data, "certificates") == 0) {
+            mode = NGX_HTTP_SSL_CERT_MODE_CERTIFICATES;
+
+        } else if (ngx_strcmp(sv->data, "directory") == 0) {
+            mode = NGX_HTTP_SSL_CERT_MODE_DIRECTORY;
+
+        } else if (ngx_strcmp(sv->data, "both") == 0) {
+            mode = NGX_HTTP_SSL_CERT_MODE_BOTH;
+
+        } else {
+            ngx_log_error(NGX_LOG_ERR, log, 0, "ssl_cert_registry: \"%V\": \"mode\" must be \"certificates\", \"directory\" or \"both\", got \"%V\"", &reg->path, sv);
+            goto failed;
+        }
+
+        mode_set = 1;
+    }
+
     /* "directory"：证书目录，解析结果写进 t->dir */
 
     if (ngx_http_ssl_cert_registry_dir(reg, root, t, pool, log) != NGX_OK) {
         goto failed;
     }
 
-    /*
-     * "certificates"：可选，但和 "directory" 至少要有一个。
-     * 只有 "directory" 时不建任何域名 key，握手时只走目录模式。
-     */
+    has_dir = (t->dir.len != 0);
+
+    /* "certificates"：数组；和 "directory" 至少要有一个 */
 
     certs = ngx_http_ssl_cert_json_get(root, "certificates");
+    has_certs = (certs != NULL);
 
-    if (certs == NULL) {
+    if (has_certs && !ngx_http_ssl_cert_json_is(certs, NGX_HTTP_SSL_CERT_JSON_ARRAY)) {
+        ngx_log_error(NGX_LOG_ERR, log, 0, "ssl_cert_registry: \"%V\": \"certificates\" must be an array", &reg->path);
+        goto failed;
+    }
 
-        if (t->dir.len == 0) {
-            ngx_log_error(NGX_LOG_ERR, log, 0,
-                          "ssl_cert_registry: \"%V\": \"certificates\" or "
-                          "\"directory\" must be present", &reg->path);
-            goto failed;
+    /*
+     * 校验 "mode" 和实际配了哪些字段一致。不一致多半是只改了清单的一半，报错比按其中一个执行安全。
+     */
+
+    if (mode_set) {
+
+        switch (mode) {
+
+        case NGX_HTTP_SSL_CERT_MODE_CERTIFICATES:
+
+            if (!has_certs) {
+                ngx_log_error(NGX_LOG_ERR, log, 0, "ssl_cert_registry: \"%V\": \"mode\" is \"certificates\" but \"certificates\" is not present", &reg->path);
+                goto failed;
+            }
+
+            if (has_dir) {
+                ngx_log_error(NGX_LOG_ERR, log, 0, "ssl_cert_registry: \"%V\": \"mode\" is \"certificates\" but \"directory\" is also set", &reg->path);
+                goto failed;
+            }
+
+            break;
+
+        case NGX_HTTP_SSL_CERT_MODE_DIRECTORY:
+
+            if (!has_dir) {
+                ngx_log_error(NGX_LOG_ERR, log, 0, "ssl_cert_registry: \"%V\": \"mode\" is \"directory\" but \"directory\" is not present", &reg->path);
+                goto failed;
+            }
+
+            if (has_certs) {
+                ngx_log_error(NGX_LOG_ERR, log, 0, "ssl_cert_registry: \"%V\": \"mode\" is \"directory\" but \"certificates\" is also set", &reg->path);
+                goto failed;
+            }
+
+            break;
+
+        default:    /* NGX_HTTP_SSL_CERT_MODE_BOTH */
+
+            if (!has_certs || !has_dir) {
+                ngx_log_error(NGX_LOG_ERR, log, 0, "ssl_cert_registry: \"%V\": \"mode\" is \"both\" but \"certificates\" and \"directory\" must both be present", &reg->path);
+                goto failed;
+            }
+
+            break;
         }
 
-        /* 用一个空数组顶替，下面的遍历自然什么都不做 */
+    } else if (!has_certs && !has_dir) {
 
+        ngx_log_error(NGX_LOG_ERR, log, 0, "ssl_cert_registry: \"%V\": \"certificates\" or \"directory\" must be present", &reg->path);
+        goto failed;
+    }
+
+    /* 没写 mode 时按实际字段推断，只用于日志 */
+
+    if (!mode_set) {
+        mode = has_certs ? (has_dir ? NGX_HTTP_SSL_CERT_MODE_BOTH : NGX_HTTP_SSL_CERT_MODE_CERTIFICATES)
+                         : NGX_HTTP_SSL_CERT_MODE_DIRECTORY;
+    }
+
+    t->mode = mode;
+
+    /* 只有 directory 时用一个空数组顶替，下面的遍历自然什么都不做 */
+
+    if (!has_certs) {
         certs = ngx_http_ssl_cert_json_array(temp_pool);
+
         if (certs == NULL) {
             goto failed;
         }
-
-    } else if (!ngx_http_ssl_cert_json_is(certs,
-                                          NGX_HTTP_SSL_CERT_JSON_ARRAY))
-    {
-        ngx_log_error(NGX_LOG_ERR, log, 0,
-                      "ssl_cert_registry: \"%V\": \"certificates\" "
-                      "must be an array", &reg->path);
-        goto failed;
     }
 
     /* 4. 逐条处理；i 是数组下标 */
