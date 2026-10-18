@@ -37,7 +37,8 @@
  *     "unmatched": "default",                  可选，default | reject，默认 default
  *     "mode": "both",                          可选，certificates | directory | both，
  *                                              显式声明用哪种来源；不写就按实际
- *                                              配了哪些字段推断，写了就必须一致
+ *                                              配了哪些字段推断。没被选中的那份
+ *                                              配置只是不生效，会写一条警告
  *     "directory": "certs",                    可选，证书目录；相对路径按清单文件
  *                                              所在目录解析
  *     "cache": 1024,                           可选，目录模式的证书缓存条数，
@@ -2172,7 +2173,7 @@ ngx_http_ssl_cert_registry_refresh(ngx_http_ssl_cert_registry_t *reg,
  *   5. ngx_hash_init() 根据 key 列表生成最终的哈希表
  *   6. 销毁 temp_pool，返回新表
  *
- * "certificates" 和 "directory" 至少要有一个；只有 directory 时，哈希表是空的，握手时只走目录模式。写了 "mode" 时，它必须和实际配了哪些字段一致。
+ * "certificates" 和 "directory" 至少要有一个。用哪一份由 "mode" 决定（不写就按实际字段推断），没被选中的那份忽略并写一条警告；只有目录模式时哈希表是空的。
  *
  * 出错时销毁两个内存池（已经读进来的 OpenSSL 对象由 cleanup 释放）并返回 NULL。
  */
@@ -2415,68 +2416,69 @@ ngx_http_ssl_cert_registry_build(ngx_http_ssl_cert_registry_t *reg,
         goto failed;
     }
 
-    /*
-     * 校验 "mode" 和实际配了哪些字段一致。不一致多半是只改了清单的一半，报错比按其中一个执行安全。
-     */
-
-    if (mode_set) {
-
-        switch (mode) {
-
-        case NGX_HTTP_SSL_CERT_MODE_CERTIFICATES:
-
-            if (!has_certs) {
-                ngx_log_error(NGX_LOG_ERR, log, 0, "ssl_cert_registry: \"%V\": \"mode\" is \"certificates\" but \"certificates\" is not present", &reg->path);
-                goto failed;
-            }
-
-            if (has_dir) {
-                ngx_log_error(NGX_LOG_ERR, log, 0, "ssl_cert_registry: \"%V\": \"mode\" is \"certificates\" but \"directory\" is also set", &reg->path);
-                goto failed;
-            }
-
-            break;
-
-        case NGX_HTTP_SSL_CERT_MODE_DIRECTORY:
-
-            if (!has_dir) {
-                ngx_log_error(NGX_LOG_ERR, log, 0, "ssl_cert_registry: \"%V\": \"mode\" is \"directory\" but \"directory\" is not present", &reg->path);
-                goto failed;
-            }
-
-            if (has_certs) {
-                ngx_log_error(NGX_LOG_ERR, log, 0, "ssl_cert_registry: \"%V\": \"mode\" is \"directory\" but \"certificates\" is also set", &reg->path);
-                goto failed;
-            }
-
-            break;
-
-        default:    /* NGX_HTTP_SSL_CERT_MODE_BOTH */
-
-            if (!has_certs || !has_dir) {
-                ngx_log_error(NGX_LOG_ERR, log, 0, "ssl_cert_registry: \"%V\": \"mode\" is \"both\" but \"certificates\" and \"directory\" must both be present", &reg->path);
-                goto failed;
-            }
-
-            break;
-        }
-
-    } else if (!has_certs && !has_dir) {
-
-        ngx_log_error(NGX_LOG_ERR, log, 0, "ssl_cert_registry: \"%V\": \"certificates\" or \"directory\" must be present", &reg->path);
-        goto failed;
-    }
-
-    /* 没写 mode 时按实际字段推断，只用于日志 */
+    /* 没写 mode 时按实际字段推断 */
 
     if (!mode_set) {
+
+        if (!has_certs && !has_dir) {
+            ngx_log_error(NGX_LOG_ERR, log, 0, "ssl_cert_registry: \"%V\": \"certificates\" or \"directory\" must be present", &reg->path);
+            goto failed;
+        }
+
         mode = has_certs ? (has_dir ? NGX_HTTP_SSL_CERT_MODE_BOTH : NGX_HTTP_SSL_CERT_MODE_CERTIFICATES)
                          : NGX_HTTP_SSL_CERT_MODE_DIRECTORY;
     }
 
+    /*
+     * mode 决定用哪种来源，另一份配置只是不生效，不算错误：
+     * 想临时停用某个来源，把 mode 改掉即可，不用把对应的字段也删掉。
+     *
+     * 但 mode 选中的来源必须真的配了东西，否则没有证书可用。
+     */
+
+    switch (mode) {
+
+    case NGX_HTTP_SSL_CERT_MODE_DIRECTORY:
+
+        if (!has_dir) {
+            ngx_log_error(NGX_LOG_ERR, log, 0, "ssl_cert_registry: \"%V\": \"mode\" is \"directory\" but \"directory\" is not present", &reg->path);
+            goto failed;
+        }
+
+        if (has_certs) {
+            ngx_log_error(NGX_LOG_WARN, log, 0, "ssl_cert_registry: \"%V\": \"mode\" is \"directory\", \"certificates\" is ignored", &reg->path);
+            has_certs = 0;
+        }
+
+        break;
+
+    case NGX_HTTP_SSL_CERT_MODE_BOTH:
+
+        if (!has_certs || !has_dir) {
+            ngx_log_error(NGX_LOG_ERR, log, 0, "ssl_cert_registry: \"%V\": \"mode\" is \"both\" but \"certificates\" and \"directory\" must both be present", &reg->path);
+            goto failed;
+        }
+
+        break;
+
+    default:    /* NGX_HTTP_SSL_CERT_MODE_CERTIFICATES */
+
+        if (!has_certs) {
+            ngx_log_error(NGX_LOG_ERR, log, 0, "ssl_cert_registry: \"%V\": \"mode\" is \"certificates\" but \"certificates\" is not present", &reg->path);
+            goto failed;
+        }
+
+        if (has_dir) {
+            ngx_log_error(NGX_LOG_WARN, log, 0, "ssl_cert_registry: \"%V\": \"mode\" is \"certificates\", \"directory\" is ignored", &reg->path);
+            t->dir.len = 0;
+        }
+
+        break;
+    }
+
     t->mode = mode;
 
-    /* 只有 directory 时用一个空数组顶替，下面的遍历自然什么都不做 */
+    /* 用不到 certificates 时用一个空数组顶替，下面的遍历自然什么都不做 */
 
     if (!has_certs) {
         certs = ngx_http_ssl_cert_json_array(temp_pool);

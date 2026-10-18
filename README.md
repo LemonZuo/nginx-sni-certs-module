@@ -55,7 +55,7 @@ nginx-sni-certs-module/
 
 - 通配符只向上找一级，和 TLS 通配符语义一致：`*.example.com` 不匹配 `a.b.example.com`，也不匹配 `example.com` 本身；
 - 同时配了 `certificates` 和 `directory` 时，先查清单，再查目录；
-- 目录模式的证书由 worker 在握手时读取，文件存在但加载失败（私钥缺失、读不出、和证书不配对）会**直接终止握手**，不会回退到默认证书；
+- 目录模式的证书由 worker 在握手时读取（解析结果有缓存，见下文），文件存在但加载失败（私钥缺失、读不出、和证书不配对）会**直接终止握手**，不会回退到默认证书；
 - SNI 先严格校验（只允许字母、数字、`-`、`.`，不允许连续或首尾的点）并转成小写，再查表或拼路径；
 - 设置证书前会先清掉默认证书（`SSL_certs_clear`），避免默认证书和新证书密钥类型不同（ECDSA / RSA）时仍然选中默认证书。
 
@@ -263,26 +263,31 @@ http {
 
 不写 `mode` 时，模块按"配了哪些字段"自动判断：只配 `certificates` 就是清单模式，只配 `directory` 就是目录模式，两个都配就都用。
 
-写了 `mode` 就必须和实际字段**完全一致**，否则整份清单不生效：
+写了 `mode` 就完全以它为准：
 
-| `mode` | 要求 |
-|---|---|
-| `"certificates"` | 必须有 `certificates`，且**不能**有 `directory` |
-| `"directory"` | 必须有 `directory`，且**不能**有 `certificates` |
-| `"both"` | `certificates` 和 `directory` 都要有 |
+| `mode` | 生效的来源 | 另一份配置 |
+|---|---|---|
+| `"certificates"` | `certificates` | `directory` 被忽略，写一条警告 |
+| `"directory"` | `directory` | `certificates` 被忽略，写一条警告 |
+| `"both"` | 两者 | — |
 
-不一致时报错，例如：
+**被忽略的那份配置不是错误**，所以可以放心留着它：想临时从"清单 + 目录"切到"只用清单"，把 `mode` 改成 `"certificates"` 就行，不用把 `directory` 也删掉（删了下次切回来还得加回去，还得记住原来的值）。忽略时会写一条 warn，不会静默：
 
 ```text
-[error] ssl_cert_registry: "/etc/nginx/ssl/certs.json": "mode" is "certificates" but "directory" is also set
+[warn] ssl_cert_registry: "/etc/nginx/ssl/certs.json": "mode" is "certificates", "directory" is ignored
 ```
 
-这么设计的原因：清单通常由脚本生成或手工维护，改了字段忘了改 `mode`（或反过来）多半是改了一半。报错比"按其中一个执行"安全得多。想临时停用某个来源，就删掉对应的字段，别留着它在旁边。
-
-`mode` 只影响校验，不影响运行时的匹配逻辑——校验通过之后，实际行为完全由字段决定。加载成功时日志里会打印生效的 mode：
+只有一种情况是错误：**`mode` 选中的来源没有配置**。这时没有任何证书可用，整份清单不生效：
 
 ```text
-[notice] ssl_cert_registry: "/etc/nginx/ssl/certs.json" loaded: 2 certificates, 3 domains, default: yes, mode: both, directory: /etc/nginx/ssl/certs, interval: 5, unmatched: default
+[error] ssl_cert_registry: "/etc/nginx/ssl/certs.json": "mode" is "certificates" but "certificates" is not present
+[error] ssl_cert_registry: "/etc/nginx/ssl/certs.json": "mode" is "both" but "certificates" and "directory" must both be present
+```
+
+加载成功时日志里会打印生效的 mode：
+
+```text
+[notice] ssl_cert_registry: "/etc/nginx/ssl/certs.json" loaded: 2 certificates, 3 domains, default: yes, mode: both, directory: /etc/nginx/ssl/certs, cache: 1024, interval: 5, unmatched: default
 ```
 
 ### 每条证书记录
@@ -478,7 +483,7 @@ nginx: [warn] ssl_cert_dir: certificate "/etc/nginx/certs/old.test.crt" has expi
 - 清单只在内容（inode、修改时间、大小）变化时重新加载；证书文件单独变化需要 `touch` 清单；
 - 修改时间精度到秒：原地改写且大小不变、又发生在同一秒内，可能漏检；用 `mv` 原子替换可以避免；
 - 同一份清单被多个 server 引用时共用策略和目录，需要区分就拆清单；
-- 目录模式每次握手读盘并解析 PEM，不适合证书很多或 TLS 并发很高的场景。
+- 目录模式每次握手至少一次 `stat`（缓存未命中时还要读盘并解析 PEM），证书很多、TLS 并发很高时开销会比清单模式明显；缓存条数不够时会来回淘汰，退化成"每次都重新解析"。
 
 ## 测试
 
@@ -487,7 +492,7 @@ nginx: [warn] ssl_cert_dir: certificate "/etc/nginx/certs/old.test.crt" has expi
 NGINX_VERSION=1.31.6 ./test.sh   # 指定版本
 ```
 
-在临时的 `alpine` 容器里编译 nginx 和模块（nginx 默认 `-Werror`，有编译警告会直接失败），然后跑 124 项断言：
+在临时的 `alpine` 容器里编译 nginx 和模块（nginx 默认 `-Werror`，有编译警告会直接失败），然后跑 166 项断言：
 
 - 目录模式（9443）：精确匹配、RSA / ECDSA 混用、通配符、多级子域名、默认证书、无 SNI、非法 SNI；
 - 清单模式（9444）：上面这些，加上一张证书多个域名、相对路径、`enabled: false`、`isDefault` 占位证书；
@@ -495,7 +500,7 @@ NGINX_VERSION=1.31.6 ./test.sh   # 指定版本
 - 清单顶层配置（9447）：`interval` 支持整数和 `"5s"` 形式、`interval: 0` 时下一次握手即生效、删除 `interval` 后回落到默认值；
 - JSON 解析（19 项）：顶层不是对象、末尾有多余内容、空文件、`null`、负数、小数、前导零、数字溢出、`\u` 转义、未知转义、字符串没有结束、成员名重复、缺冒号、缺逗号、对象/数组没有结束、嵌套太深、字符串里有控制字符 —— 每一种都必须整份清单不生效并保留旧表；
 - `directory`：只有 `directory` 的清单、相对路径按清单目录解析、空字符串、`certificates` 和 `directory` 都缺失；
-- `mode`（11 项）：三种取值与实际字段一致时正常加载、不写时按字段推断；`mode` 与字段不一致（配了多余字段、缺了对应字段）、取值非法、不是字符串时整份清单不生效；
+- `mode`（13 项）：三种取值正常加载、不写时按字段推断；`mode` 选中的来源缺失、取值非法、不是字符串时整份清单不生效；`mode` 之外的多余字段被忽略并告警，且确实不生效；
 - 目录模式的缓存（6 项）：缓存命中、证书文件变化后自动重新解析、`cache: 0` 时不缓存、缓存条数为 1 时来回淘汰仍然正确、非法 `cache` 值整份清单不生效；
 - 匹配不上的 info 日志：三种结尾都有、非法 SNI 里的引号被替换、带客户端地址、没有 crit 日志；
 - 启动检查（单独的配置跑 `nginx -t`）：私钥不可读、目录进不去（同一目录只报一次）、30 天内到期、已过期、目录模式的证书；`user root` 时不检查权限；正常配置没有误报；

@@ -385,13 +385,24 @@ mode_ok  'mode=directory 与实际一致'    '{ "interval": 0, "mode": "director
 mode_ok  'mode=both 与实际一致'         "{ \"interval\": 0, \"mode\": \"both\", \"directory\": \"/certs\", $ACERT }" both
 mode_ok  '不写 mode 时按字段推断'       "{ \"interval\": 0, $ACERT }" certificates
 
-mode_bad 'mode=certificates 却配了 directory' "{ \"interval\": 0, \"mode\": \"certificates\", \"directory\": \"/certs\", $ACERT }" '"mode" is "certificates" but "directory" is also set'
-mode_bad 'mode=directory 却配了 certificates' '{ "interval": 0, "mode": "directory", "directory": "/certs", "certificates": [] }' '"mode" is "directory" but "certificates" is also set'
 mode_bad 'mode=directory 却没有 directory'    "{ \"interval\": 0, \"mode\": \"directory\", $ACERT }" '"mode" is "directory" but "directory" is not present'
 mode_bad 'mode=certificates 却没有 certificates' '{ "interval": 0, "mode": "certificates", "directory": "/certs" }' '"mode" is "certificates" but "certificates" is not present'
 mode_bad 'mode=both 但只有 certificates'      "{ \"interval\": 0, \"mode\": \"both\", $ACERT }" '"mode" is "both" but "certificates" and "directory" must both be present'
 mode_bad 'mode 取值非法'                      '{ "interval": 0, "mode": "cert", "certificates": [] }' 'got "cert"'
 mode_bad 'mode 不是字符串'                    '{ "interval": 0, "mode": 1, "certificates": [] }' '"mode" must be "certificates", "directory" or "both"'
+
+# 没被 mode 选中的那份配置只是不生效，不算错误
+mode_ok 'mode=certificates 时忽略 directory' "{ \"interval\": 0, \"mode\": \"certificates\", \"directory\": \"/certs\", $ACERT }" certificates
+assert 'mode=certificates：directory 被忽略并告警' \
+    grep -q '"mode" is "certificates", "directory" is ignored' $LOG
+
+mode_ok 'mode=directory 时忽略 certificates' '{ "interval": 0, "mode": "directory", "directory": "/certs", "certificates": [ { "domains": ["zzz.test"], "cert": "/certs/a.test.crt", "key": "/certs/a.test.key" } ] }' directory
+assert 'mode=directory：certificates 被忽略并告警' \
+    grep -q '"mode" is "directory", "certificates" is ignored' $LOG
+
+# 被忽略的 certificates 真的不生效：zzz.test 拿不到那张证书，只能回退默认证书
+check 9447 zzz.test       CN=default.invalid
+check 9447 a.test         CN=a.test              # 目录模式生效，a.test 来自 /certs 目录
 
 # 恢复成可用的清单，后面的用例还要用 9447
 write_policy_registry '"interval": 0,' '"unmatched": "default",' yes
