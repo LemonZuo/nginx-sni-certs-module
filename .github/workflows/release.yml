@@ -1,0 +1,265 @@
+name: release
+
+# 推 v<主>.<次> 形式的标签时触发，例如 v1.0、v1.1。
+# 编译、验证、把 .so 挂到对应的 GitHub Release 上。
+#
+# 发版流程：
+#   git tag -a v1.0 -m "标题" -m "这次改了什么"   # 加注释可以自定义发布说明
+#   git push origin v1.0
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    name: 检查标签
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 标签必须是 v<主>.<次>
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+$'; then
+            echo "::error::标签 $tag 不符合 v<主版本>.<次版本> 的形式（例如 v1.0）"
+            exit 1
+          fi
+          echo "发布版本：$tag"
+
+  build:
+    name: 编译 nginx ${{ matrix.nginx }}
+    needs: tag
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+
+      # 要发布的 nginx 版本。加版本加一行，没人用的版本删掉。
+      #
+      # 动态模块和 nginx 版本是严格绑定的：nginx 加载时会比对版本号，
+      # 对不上直接报 "module ... version 1030006 instead of 1031007"，
+      # 所以这里列几个版本，Release 里就多几份 .so，发不出一份通用的。
+      matrix:
+        nginx:
+          - 1.28.3
+          - 1.30.6
+          - 1.31.7
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libpcre2-dev zlib1g-dev libssl-dev
+
+      - name: 下载 nginx 源码
+        run: |
+          curl -fsSLO "https://nginx.org/download/nginx-${{ matrix.nginx }}.tar.gz"
+          tar xf "nginx-${{ matrix.nginx }}.tar.gz"
+
+      # --with-compat 两边都要带：nginx 不带、模块带，加载时报
+      # "is not binary compatible"；两边都带才能互相匹配。
+      - name: 编译
+        working-directory: nginx-${{ matrix.nginx }}
+        run: |
+          ./configure \
+            --prefix=/tmp/ng \
+            --with-http_ssl_module \
+            --with-compat \
+            --add-dynamic-module="$GITHUB_WORKSPACE/ngx_http_ssl_cert_dir_module"
+          make -j"$(nproc)"
+          make install
+
+      # 光编出来不算数：真的把它加载起来，按 SNI 走一次握手，确认拿到的是
+      # 清单里那张证书。
+      #
+      # 两点讲究：
+      #   - 默认证书和清单里的证书必须是两张不同的，否则模块完全没生效、
+      #     回退到 ssl_certificate 时断言也照样通过；
+      #   - 用 SHA256 指纹比对，不用 CN 文本。subject 的格式随 OpenSSL
+      #     版本变（3.0 打印 "CN = x"，3.6 打印 "CN=x"），指纹不会。
+      - name: 验证模块能加载并选对证书
+        run: |
+          mkdir -p /tmp/ng/conf
+          gen() {   # $1 = CN
+            openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+              -days 365 -subj "/CN=$1" \
+              -keyout "/tmp/ng/conf/$1.key" -out "/tmp/ng/conf/$1.crt" 2>/dev/null
+          }
+          gen default.invalid
+          gen verify.test
+
+          # 统一转成小写再比：十六进制的大小写也随 OpenSSL 版本变
+          fp() { openssl x509 -noout -fingerprint -sha256 | cut -d= -f2 | tr 'A-F' 'a-f'; }
+          want_sni=$(fp </tmp/ng/conf/verify.test.crt)
+          want_default=$(fp </tmp/ng/conf/default.invalid.crt)
+
+          cat >/tmp/ng/conf/certs.json <<'JSON'
+          {
+            "certificates": [
+              {
+                "domains": ["verify.test"],
+                "cert": "verify.test.crt",
+                "key":  "verify.test.key"
+              }
+            ]
+          }
+          JSON
+
+          cat >/tmp/ng/conf/nginx.conf <<'CONF'
+          load_module modules/ngx_http_ssl_cert_dir_module.so;
+          events {}
+          http {
+              server {
+                  listen 8443 ssl;
+                  ssl_certificate     /tmp/ng/conf/default.invalid.crt;
+                  ssl_certificate_key /tmp/ng/conf/default.invalid.key;
+                  ssl_cert_registry   /tmp/ng/conf/certs.json;
+              }
+          }
+          CONF
+
+          /tmp/ng/sbin/nginx -t -p /tmp/ng -c /tmp/ng/conf/nginx.conf
+          /tmp/ng/sbin/nginx -p /tmp/ng -c /tmp/ng/conf/nginx.conf
+          sleep 1
+
+          got_sni=$(echo | openssl s_client -connect 127.0.0.1:8443 \
+            -servername verify.test 2>/dev/null \
+            | openssl x509 -noout -fingerprint -sha256 | cut -d= -f2 | tr 'A-F' 'a-f')
+          got_default=$(echo | openssl s_client -connect 127.0.0.1:8443 \
+            2>/dev/null \
+            | openssl x509 -noout -fingerprint -sha256 | cut -d= -f2 | tr 'A-F' 'a-f')
+          /tmp/ng/sbin/nginx -s stop -p /tmp/ng -c /tmp/ng/conf/nginx.conf
+
+          echo "SNI=verify.test    期望 $want_sni"
+          echo "                   实际 $got_sni"
+          echo "无 SNI（应回退）   期望 $want_default"
+          echo "                   实际 $got_default"
+
+          [ "$got_sni" = "$want_sni" ] || {
+            echo "::error::SNI 没有选中清单里的证书"; exit 1; }
+          [ "$got_default" = "$want_default" ] || {
+            echo "::error::没有 SNI 时应该回退到 ssl_certificate"; exit 1; }
+
+          echo "验证通过"
+
+      - name: 重命名产物
+        run: |
+          mkdir -p dist
+          cp "/tmp/ng/modules/ngx_http_ssl_cert_dir_module.so" \
+             "dist/ngx_http_ssl_cert_dir_module-${{ matrix.nginx }}.so"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-${{ matrix.nginx }}
+          path: dist/*.so
+          if-no-files-found: error
+
+  release:
+    name: 发布
+    needs: [tag, build]
+    runs-on: ubuntu-24.04
+    steps:
+      # 为了读标签注释，需要把 tag 对象取下来
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 生成校验和
+        run: |
+          cd dist
+          sha256sum *.so >SHA256SUMS
+          cat SHA256SUMS
+
+      # 说明分两段：
+      #   安装段  由工作流生成，列出实际编出来的 .so、加载方式和校验和，
+      #           这部分不手写，免得和产物对不上；
+      #   变更段  标签打了注释就用注释，没打就用 GitHub 从提交记录生成的
+      #           列表。想手写发布说明就在打标签时写注释。
+      - name: 生成 release 说明
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          : >/tmp/changes.md
+
+          # 带注释的标签（git tag -a）里写的内容当变更说明，注释第一行是
+          # 标题，不重复放进正文；轻量标签（git tag v1.0）没有注释，落到
+          # 下面由提交记录生成。
+          if [ "$(git cat-file -t "$tag")" = tag ]; then
+            git tag -l --format='%(contents:body)' "$tag" >/tmp/changes.md
+            [ -s /tmp/changes.md ] || \
+              git tag -l --format='%(contents:subject)' "$tag" >/tmp/changes.md
+          fi
+
+          if [ -s /tmp/changes.md ]; then
+            echo "变更说明取自标签注释"
+          else
+            gh api "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+              -f tag_name="$tag" --jq .body >/tmp/changes.md
+            echo "变更说明由提交记录生成"
+          fi
+
+          {
+            echo "## 安装"
+            echo
+            echo "下载和你的 nginx **完全同版本**的 .so："
+            echo
+            echo "| nginx 版本 | 文件 |"
+            echo "|---|---|"
+            for f in dist/ngx_http_ssl_cert_dir_module-*.so; do
+              base=$(basename "$f")
+              ver=${base#ngx_http_ssl_cert_dir_module-}
+              ver=${ver%.so}
+              echo "| $ver | \`$base\` |"
+            done
+            echo
+            echo "放到 nginx 的 \`modules/\` 目录，在 \`nginx.conf\` 顶层加载："
+            echo
+            echo '```nginx'
+            echo 'load_module modules/ngx_http_ssl_cert_dir_module-1.30.6.so;'
+            echo '```'
+            echo
+            echo "两点注意："
+            echo
+            echo "- 版本号要对得上：动态模块会比对 nginx 版本，对不上会报 \`module ... version ... instead of ...\`；"
+            echo "- 目标 nginx 必须是用 \`--with-compat\` 编译的，否则会报 \`is not binary compatible\`。"
+            echo
+            echo "SHA256："
+            echo
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+            echo
+            echo "---"
+            echo
+            cat /tmp/changes.md
+          } >/tmp/body.md
+
+          echo "===== 说明预览 ====="
+          cat /tmp/body.md
+
+      - name: 创建 release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+
+          # 重跑时覆盖，而不是失败
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" --title "$tag" --notes-file /tmp/body.md
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" --title "$tag" --notes-file /tmp/body.md dist/*
+          fi
+
+          echo "已发布：$(gh release view "$tag" --json url --jq .url)"

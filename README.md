@@ -34,6 +34,7 @@ nginx-sni-certs-module/
 ├── README.md
 ├── test.sh                                     # 在 Docker 里编译 nginx 和模块并测试
 ├── bench.sh                                    # 在 Docker 里做 TLS 握手性能对比
+├── .github/workflows/release.yml               # 打标签时编译并发布 .so
 └── ngx_http_ssl_cert_dir_module/
     ├── config                                  # 构建描述
     ├── ngx_http_ssl_cert_dir_module.c          # 模块主体：配置、启动检查、握手、清单加载
@@ -509,3 +510,22 @@ NGINX_VERSION=1.31.6 ./test.sh   # 指定版本
 | 默认证书热切换 | 改成某个真实证书兼做默认；两条 `isDefault` 时拒绝新清单；去掉后回退到 `ssl_certificate` |
 
 整个过程中 nginx master 进程没有重启。
+
+## 发布
+
+推一个 `v<主>.<次>` 形式的标签，GitHub Actions 会自动编译并发布到 Releases：
+
+```bash
+git tag -a v1.0 -m "首个发布" -m "支持清单和目录两种来源。"
+git push origin v1.0
+```
+
+工作流（`.github/workflows/release.yml`）做三件事：
+
+- 按矩阵逐个 nginx 版本编译。动态模块和 nginx 版本是**严格绑定**的，所以每个版本单独出一份 `.so`，发不出一份通用的；
+- 每个版本都真的加载起来、按 SNI 走一次握手，比对证书指纹，确认选中的是清单里那张证书、没有 SNI 时回退到 `ssl_certificate`；
+- 把 `.so` 和 SHA256 挂到 Release 上。
+
+发布说明分两段：**安装段**由工作流生成，列出实际编出来的产物、加载方式和校验和；**变更段**取标签注释，标签没写注释就由 GitHub 从提交记录生成。想手写发布说明，就在 `git tag -a` 的注释里写。
+
+要增删支持的 nginx 版本，改工作流里的 `matrix.nginx` 一行即可。产物依赖 glibc ≥ 2.33（Ubuntu 22.04+、Debian 12+、RHEL 9+）；更老的系统需要自行编译。
