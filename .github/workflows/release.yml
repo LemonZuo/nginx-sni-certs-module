@@ -285,7 +285,7 @@ jobs:
               echo "| $ver | \`$base\` |"
             done
             echo
-            echo "这几个版本是发布时从 nginx.org 现取的（主线 / 稳定 / 上一个稳定）：\`$NGINX_MATRIX\`。"
+            echo "这几个版本是发布时从 nginx.org 现取的（主线 / 稳定 / 上一个稳定）：$(printf '%s' "$NGINX_MATRIX" | jq -r 'join(" / ")')。"
             echo
             echo "放到 nginx 的 \`modules/\` 目录，在 \`nginx.conf\` 顶层加载："
             echo
