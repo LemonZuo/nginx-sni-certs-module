@@ -3,6 +3,9 @@ name: release
 # 推 v<主>.<次> 形式的标签时触发，例如 v1.0、v1.1。
 # 编译、验证、把 .so 挂到对应的 GitHub Release 上。
 #
+# 要编哪些 nginx 版本是发布时现从 nginx.org 取的，不在仓库里写死，见
+# 下面的 versions job。
+#
 # 发版流程：
 #   git tag -a v1.0 -m "标题" -m "这次改了什么"   # 加注释可以自定义发布说明
 #   git push origin v1.0
@@ -29,23 +32,74 @@ jobs:
           fi
           echo "发布版本：$tag"
 
+  # 每次发布都现取一遍 nginx 版本，不写死在仓库里：写死的话，nginx 发了新版
+  # 而这里没人改，Release 里就缺一份 .so，而且没有任何提示。
+  versions:
+    name: 取 nginx 版本
+    needs: tag
+    runs-on: ubuntu-24.04
+    outputs:
+      nginx: ${{ steps.pick.outputs.nginx }}
+    steps:
+      - id: pick
+        name: 从 nginx.org 取主线 / 稳定 / 上一个稳定
+        run: |
+          # 页面结构：<h4>Mainline version</h4> 下面一张表，表里第一个
+          # nginx-<版本>.tar.gz 就是该段的版本；Legacy versions 下面按版本从
+          # 新到旧排一串表，第一个就是上一个稳定版。
+          #
+          # 把每个 '<' 换行切开，挑出标题行和 tarball 链接行，顺序天然就是页
+          # 面顺序，不用真去解析 HTML 结构。取不到就退出非零：宁可发布失败，
+          # 也不要静默少发几个版本。
+          set -euo pipefail
+
+          curl -fsS --retry 3 --retry-delay 2 --max-time 30 \
+            https://nginx.org/en/download.html \
+          | tr '<' '\n' | sed -n \
+              -e 's/^h4>Mainline version.*/mainline/p' \
+              -e 's/^h4>Stable version.*/stable/p' \
+              -e 's/^h4>Legacy versions.*/legacy/p' \
+              -e 's/^a href="\/download\/nginx-\([0-9][0-9.]*\)\.tar\.gz".*/\1/p' \
+          | awk '
+              $0 == "mainline" { want = "mainline"; next }
+              $0 == "stable"   { want = "stable";   next }
+              $0 == "legacy"   { want = "legacy";   next }
+              want == "mainline" { mainline = $0; want = ""; next }
+              want == "stable"   { stable   = $0; want = ""; next }
+              want == "legacy"   { legacy   = $0; want = ""; next }
+              END {
+                  if (mainline == "" || stable == "" || legacy == "") {
+                      print "取版本失败：nginx.org 下载页的结构可能变了" > "/dev/stderr"
+                      exit 1
+                  }
+                  printf "%s %s %s\n", mainline, stable, legacy
+              }
+            ' >/tmp/versions.txt
+
+          read -r mainline stable legacy </tmp/versions.txt
+          echo "主线       $mainline"
+          echo "稳定       $stable"
+          echo "上一个稳定 $legacy"
+
+          nginx=$(jq -nc --arg a "$mainline" --arg b "$stable" --arg c "$legacy" \
+            '[$a, $b, $c]')
+          echo "矩阵 $nginx"
+          echo "nginx=$nginx" >>"$GITHUB_OUTPUT"
+
   build:
     name: 编译 nginx ${{ matrix.nginx }}
-    needs: tag
+    needs: [tag, versions]
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
 
-      # 要发布的 nginx 版本。加版本加一行，没人用的版本删掉。
+      # 版本是 versions job 现取的，不在仓库里写死。
       #
-      # 动态模块和 nginx 版本是严格绑定的：nginx 加载时会比对版本号，
-      # 对不上直接报 "module ... version 1030006 instead of 1031007"，
-      # 所以这里列几个版本，Release 里就多几份 .so，发不出一份通用的。
+      # 动态模块和 nginx 版本是严格绑定的：nginx 加载时会比对版本号，对不上
+      # 直接报 "module ... version 1030006 instead of 1031007"，所以有几个版
+      # 本，Release 里就有几份 .so，发不出一份通用的。
       matrix:
-        nginx:
-          - 1.28.3
-          - 1.30.6
-          - 1.31.7
+        nginx: ${{ fromJSON(needs.versions.outputs.nginx) }}
 
     steps:
       - uses: actions/checkout@v7
@@ -161,7 +215,7 @@ jobs:
 
   release:
     name: 发布
-    needs: [tag, build]
+    needs: [tag, versions, build]
     runs-on: ubuntu-24.04
     steps:
       # 只需要标签注释，用不上完整历史；留着 fetch-depth: 0 是为了后面
@@ -189,6 +243,7 @@ jobs:
       - name: 生成 release 说明
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NGINX_MATRIX: ${{ needs.versions.outputs.nginx }}
         run: |
           tag="${GITHUB_REF_NAME}"
           : >/tmp/changes.md
@@ -229,6 +284,8 @@ jobs:
               ver=${ver%.so}
               echo "| $ver | \`$base\` |"
             done
+            echo
+            echo "这几个版本是发布时从 nginx.org 现取的（主线 / 稳定 / 上一个稳定）：\`$NGINX_MATRIX\`。"
             echo
             echo "放到 nginx 的 \`modules/\` 目录，在 \`nginx.conf\` 顶层加载："
             echo
