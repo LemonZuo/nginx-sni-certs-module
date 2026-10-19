@@ -48,7 +48,7 @@ jobs:
           - 1.31.7
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 安装编译依赖
         run: |
@@ -153,7 +153,7 @@ jobs:
           cp "/tmp/ng/modules/ngx_http_ssl_cert_dir_module.so" \
              "dist/ngx_http_ssl_cert_dir_module-${{ matrix.nginx }}.so"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: module-${{ matrix.nginx }}
           path: dist/*.so
@@ -164,12 +164,13 @@ jobs:
     needs: [tag, build]
     runs-on: ubuntu-24.04
     steps:
-      # 为了读标签注释，需要把 tag 对象取下来
-      - uses: actions/checkout@v4
+      # 只需要标签注释，用不上完整历史；留着 fetch-depth: 0 是为了后面
+      # 重新拉标签对象时不至于卡在浅克隆上
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -191,6 +192,12 @@ jobs:
         run: |
           tag="${GITHUB_REF_NAME}"
           : >/tmp/changes.md
+
+          # checkout 会把 refs/tags/<tag> 重写成指向 commit 的轻量标签
+          # （它拉的是 +<sha>:refs/tags/<tag>），带注释的 tag 对象就丢了。
+          # 这里按标签名重新拉一次，把真标签取回来。
+          git fetch --force --no-recurse-submodules origin \
+            "+refs/tags/$tag:refs/tags/$tag" || true
 
           # 带注释的标签（git tag -a）里写的内容当变更说明，注释第一行是
           # 标题，不重复放进正文；轻量标签（git tag v1.0）没有注释，落到
